@@ -1,0 +1,16 @@
+/state/*
+!/state/.gitkeep
+/bin/*
+!/bin/.gitkeep
+**/target/
+**/node_modules/
+**/__pycache__/
+*.pyc
+*.log
+*.sql.gz
+*.zip
+.env
+**/controller.json
+**/app.key
+**/signing.key
+/source/web/dist-live/

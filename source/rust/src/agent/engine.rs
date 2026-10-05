@@ -1,0 +1,459 @@
+use super::{
+    journal::{Journal, Meter},
+    resolver::Resolver,
+};
+use crate::{now, protocol::*, valid_id, valid_target};
+use anyhow::{Result, bail};
+use arc_swap::ArcSwap;
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    sync::{
+        Arc,
+        atomic::{AtomicI64, AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream, UdpSocket},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc},
+    task::{JoinHandle, JoinSet},
+};
+use tokio_util::sync::CancellationToken;
+struct Active {
+    rule: Rule,
+    meter: Arc<Meter>,
+}
+struct Forward {
+    active: Arc<ArcSwap<Active>>,
+    cancel: CancellationToken,
+    task: JoinHandle<()>,
+}
+pub struct Engine {
+    rules: Mutex<HashMap<String, Forward>>,
+    pub journal: Arc<Journal>,
+    pub resolver: Arc<Resolver>,
+    tcp: Arc<Semaphore>,
+    udp: Arc<Semaphore>,
+    queued: Arc<Semaphore>,
+    deadline: AtomicI64,
+    stop: CancellationToken,
+    checks: Mutex<Vec<TargetCheck>>,
+    probes: Arc<Semaphore>,
+}
+impl Engine {
+    pub fn new(
+        journal: Arc<Journal>,
+        resolver: Arc<Resolver>,
+        tcp: usize,
+        udp: usize,
+    ) -> Arc<Self> {
+        let e = Arc::new(Self {
+            rules: Mutex::new(HashMap::new()),
+            journal,
+            resolver,
+            tcp: Arc::new(Semaphore::new(tcp)),
+            udp: Arc::new(Semaphore::new(udp)),
+            queued: Arc::new(Semaphore::new(8 << 20)),
+            deadline: AtomicI64::new(0),
+            stop: CancellationToken::new(),
+            checks: Mutex::new(Vec::new()),
+            probes: Arc::new(Semaphore::new(8)),
+        });
+        let weak = Arc::downgrade(&e);
+        tokio::spawn(async move {
+            let mut t = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                t.tick().await;
+                let Some(e) = weak.upgrade() else { break };
+                if e.stop.is_cancelled() {
+                    break;
+                }
+                let mut map = e.rules.lock().await;
+                let stale = now() > e.deadline.load(Ordering::Relaxed);
+                let ids: Vec<_> = map
+                    .iter()
+                    .filter(|(_, f)| stale || f.active.load().rule.expires_at <= now())
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for id in ids {
+                    if let Some(f) = map.remove(&id) {
+                        f.cancel.cancel();
+                        let _ = f.task.await;
+                    }
+                }
+            }
+        });
+        let weak = Arc::downgrade(&e);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                let Some(e) = weak.upgrade() else { break };
+                if e.stop.is_cancelled() {
+                    break;
+                }
+                e.check_targets().await;
+            }
+        });
+        e
+    }
+    pub async fn suspend(&self) {
+        let mut map = self.rules.lock().await;
+        for (_, f) in map.drain() {
+            f.cancel.cancel();
+            let _ = f.task.await;
+        }
+        self.checks.lock().await.clear();
+    }
+    pub async fn close(&self) {
+        self.stop.cancel();
+        self.suspend().await;
+    }
+    pub async fn apply(self: &Arc<Self>, c: &Config) -> Vec<RuleError> {
+        let mut errors = Vec::new();
+        if c.version != 1
+            || c.valid_for_seconds == 0
+            || c.valid_for_seconds > 30
+            || c.rules.len() > 512
+        {
+            self.suspend().await;
+            return vec![RuleError {
+                code: "invalid_config".into(),
+                message: "configuration rejected".into(),
+                ..Default::default()
+            }];
+        }
+        self.deadline
+            .store(now() + c.valid_for_seconds as i64, Ordering::Relaxed);
+        let mut wanted = HashMap::new();
+        for r in &c.rules {
+            let good_ip = r
+                .listen_ip
+                .parse::<IpAddr>()
+                .is_ok_and(|i| !i.is_unspecified() && !i.is_multicast());
+            let targets = r.targets();
+            if !good_ip
+                || r.listen_port < 1024
+                || !valid_id(&r.id)
+                || !valid_id(&r.cycle_id)
+                || r.expires_at <= now()
+                || !valid_target(&r.target_host, r.target_port)
+                || (r.load_balance && (targets.len() < 2 || targets.len() > 16))
+                || targets.iter().any(|t| !valid_target(&t.host, t.port))
+            {
+                errors.push(RuleError {
+                    rule_id: r.id.clone(),
+                    code: "invalid_rule".into(),
+                    message: "invalid or expired rule".into(),
+                });
+                continue;
+            }
+            wanted.entry(r.id.clone()).or_insert_with(|| r.clone());
+        }
+        let mut map = self.rules.lock().await;
+        let mut remove = Vec::new();
+        for (id, f) in map.iter() {
+            let old = f.active.load();
+            if let Some(r) = wanted.get(id)
+                && old.rule.listen_ip == r.listen_ip
+                && old.rule.listen_port == r.listen_port
+                && old.rule.targets() == r.targets()
+            {
+                if old.rule != *r {
+                    f.active.store(Arc::new(Active {
+                        rule: r.clone(),
+                        meter: self.journal.meter(&r.id, &r.cycle_id),
+                    }));
+                }
+                continue;
+            }
+            remove.push(id.clone());
+        }
+        for id in remove {
+            if let Some(f) = map.remove(&id) {
+                f.cancel.cancel();
+                let _ = f.task.await;
+            }
+        }
+        for (id, r) in wanted {
+            if map.contains_key(&id) {
+                continue;
+            }
+            match self.start(r).await {
+                Ok(f) => {
+                    map.insert(id, f);
+                }
+                Err(_) => errors.push(RuleError {
+                    rule_id: id,
+                    code: "bind_failed".into(),
+                    message: "TCP/UDP port group could not start".into(),
+                }),
+            }
+        }
+        errors
+    }
+    async fn start(self: &Arc<Self>, r: Rule) -> Result<Forward> {
+        let addr = SocketAddr::new(r.listen_ip.parse()?, r.listen_port);
+        let tcp = TcpListener::bind(addr).await?;
+        let udp = Arc::new(UdpSocket::bind(addr).await?);
+        let active = Arc::new(ArcSwap::from_pointee(Active {
+            meter: self.journal.meter(&r.id, &r.cycle_id),
+            rule: r,
+        }));
+        let cancel = CancellationToken::new();
+        let cursor = Arc::new(AtomicUsize::new(0));
+        let e = self.clone();
+        let a = active.clone();
+        let c = cancel.clone();
+        let cur = cursor.clone();
+        let task = tokio::spawn(async move {
+            let t = tokio::spawn(tcp_loop(e.clone(), a.clone(), c.clone(), cur.clone(), tcp));
+            let u = tokio::spawn(udp_loop(e, a, c, cur, udp));
+            let _ = tokio::join!(t, u);
+        });
+        Ok(Forward {
+            active,
+            cancel,
+            task,
+        })
+    }
+    pub async fn target_checks(&self) -> Vec<TargetCheck> {
+        self.checks.lock().await.clone()
+    }
+    async fn check_targets(&self) {
+        let items: Vec<_> = {
+            let map = self.rules.lock().await;
+            map.values()
+                .flat_map(|f| {
+                    let a = f.active.load();
+                    a.rule
+                        .targets()
+                        .into_iter()
+                        .map(|t| (a.rule.id.clone(), t))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let mut tasks = JoinSet::new();
+        for (rule, t) in items {
+            let resolver = self.resolver.clone();
+            let slots = self.probes.clone();
+            tasks.spawn(async move {
+                let _p = slots.acquire().await.ok();
+                let start = Instant::now();
+                let check = async {
+                    let ip = resolver.resolve(&t.host).await?;
+                    let c = tokio::time::timeout(
+                        Duration::from_secs(3),
+                        TcpStream::connect((ip, t.port)),
+                    )
+                    .await
+                    .map_err(|_| anyhow::anyhow!("timeout"))??;
+                    drop(c);
+                    Ok::<_, anyhow::Error>(())
+                };
+                let result = tokio::time::timeout(Duration::from_secs(4), check).await;
+                let (status, latency_ms) = match result {
+                    Ok(Ok(())) => (
+                        "ok".into(),
+                        (start.elapsed().as_secs_f64() * 10000.0).round().max(1.0) / 10.0,
+                    ),
+                    Err(_) => ("timeout".into(), 0.0),
+                    Ok(Err(e)) => {
+                        let msg = e.to_string();
+                        let code = if msg == "blocked" {
+                            "blocked"
+                        } else if msg == "dns_error" {
+                            "dns_error"
+                        } else if msg.contains("refused") {
+                            "refused"
+                        } else if msg.contains("timeout") || msg.contains("timed out") {
+                            "timeout"
+                        } else {
+                            "unreachable"
+                        };
+                        (code.into(), 0.0)
+                    }
+                };
+                TargetCheck {
+                    rule_id: rule,
+                    host: t.host,
+                    port: t.port,
+                    status,
+                    latency_ms,
+                    checked_at: now(),
+                }
+            });
+        }
+        let mut out = Vec::new();
+        loop {
+            tokio::select! {_=self.stop.cancelled()=>{tasks.shutdown().await;return},r=tasks.join_next()=>match r{Some(Ok(c))=>out.push(c),Some(Err(_))=>(),None=>break}}
+        }
+        *self.checks.lock().await = out;
+    }
+}
+fn ordered(a: &ArcSwap<Active>, cursor: &AtomicUsize) -> Vec<Target> {
+    let mut list = a.load().rule.targets();
+    let n = list.len();
+    if n > 1 {
+        list.rotate_left(cursor.fetch_add(1, Ordering::Relaxed) % n)
+    }
+    list
+}
+fn tune(c: &TcpStream) {
+    let _ = c.set_nodelay(true);
+    let sock = socket2::SockRef::from(c);
+    let _ = sock.set_tcp_keepalive(
+        &socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(30))
+            .with_interval(Duration::from_secs(10))
+            .with_retries(3),
+    );
+}
+async fn tcp_loop(
+    e: Arc<Engine>,
+    a: Arc<ArcSwap<Active>>,
+    cancel: CancellationToken,
+    cursor: Arc<AtomicUsize>,
+    listener: TcpListener,
+) {
+    let mut tasks = JoinSet::new();
+    loop {
+        tokio::select! {biased;
+         _=cancel.cancelled()=>break,
+         Some(_)=tasks.join_next(),if !tasks.is_empty()=>(),
+         result=listener.accept()=>match result{
+          Ok((client,_))=>{let Ok(slot)=e.tcp.clone().try_acquire_owned()else{drop(client);continue};let e=e.clone();let a=a.clone();let c=cancel.clone();let targets=ordered(&a,&cursor);tasks.spawn(async move{let _slot=slot;tokio::select!{_=c.cancelled()=>(),_=stream(e,a,client,targets)=>()}});},
+          Err(_)=>tokio::time::sleep(Duration::from_millis(50)).await
+         }
+        }
+    }
+    drop(listener);
+    tasks.shutdown().await;
+}
+async fn stream(
+    e: Arc<Engine>,
+    a: Arc<ArcSwap<Active>>,
+    mut client: TcpStream,
+    targets: Vec<Target>,
+) {
+    let dial = async {
+        for t in targets {
+            if let Ok(ip) = e.resolver.resolve(&t.host).await
+                && let Ok(Ok(c)) =
+                    tokio::time::timeout(Duration::from_secs(3), TcpStream::connect((ip, t.port)))
+                        .await
+            {
+                return Ok(c);
+            }
+        }
+        bail!("unreachable")
+    };
+    let Ok(Ok(mut remote)) = tokio::time::timeout(Duration::from_secs(8), dial).await else {
+        return;
+    };
+    tune(&client);
+    tune(&remote);
+    let (cr, cw) = client.split();
+    let (rr, rw) = remote.split();
+    let _ = tokio::try_join!(pump(cr, rw, a.clone(), true), pump(rr, cw, a, false));
+}
+async fn pump<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin>(
+    mut src: R,
+    mut dst: W,
+    a: Arc<ArcSwap<Active>>,
+    up: bool,
+) -> Result<()> {
+    let mut buf = vec![0u8; 32768];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(300), src.read(&mut buf)).await??;
+        if n == 0 {
+            dst.shutdown().await?;
+            return Ok(());
+        }
+        let mut at = 0;
+        while at < n {
+            let m = tokio::time::timeout(Duration::from_secs(15), dst.write(&buf[at..n])).await??;
+            if m == 0 {
+                bail!("write zero")
+            }
+            a.load().meter.add(m, up);
+            at += m;
+        }
+    }
+}
+type Packet = (Vec<u8>, OwnedSemaphorePermit);
+async fn udp_loop(
+    e: Arc<Engine>,
+    a: Arc<ArcSwap<Active>>,
+    cancel: CancellationToken,
+    cursor: Arc<AtomicUsize>,
+    socket: Arc<UdpSocket>,
+) {
+    let mut clients: HashMap<SocketAddr, mpsc::Sender<Packet>> = HashMap::new();
+    let mut tasks = JoinSet::new();
+    let mut buf = vec![0u8; 65535];
+    loop {
+        tokio::select! {biased;
+         _=cancel.cancelled()=>break,
+         Some(_)=tasks.join_next(),if !tasks.is_empty()=>{clients.retain(|_,tx|!tx.is_closed());},
+         result=socket.recv_from(&mut buf)=>{let Ok((n,client))=result else{break};
+          if clients.get(&client).is_some_and(|tx|tx.is_closed()){clients.remove(&client);}
+          if let std::collections::hash_map::Entry::Vacant(entry) = clients.entry(client){
+           let Ok(slot)=e.udp.clone().try_acquire_owned()else{continue};
+           // Absorb a full scheduler burst; the shared byte semaphore still caps total queued payload at 8 MiB.
+           let(tx,rx)=mpsc::channel(128);entry.insert(tx);
+           let(e,a,cursor,socket,c)=(e.clone(),a.clone(),cursor.clone(),socket.clone(),cancel.clone());
+           tasks.spawn(async move{let _slot=slot;tokio::select!{_=c.cancelled()=>(),_=udp_session(e,a,cursor,socket,client,rx)=>()}});
+          }
+          if let Ok(bytes)=e.queued.clone().try_acquire_many_owned(n.max(1) as u32){let _=clients[&client].try_send((buf[..n].to_vec(),bytes));}
+         }
+        }
+    }
+    clients.clear();
+    tasks.shutdown().await;
+}
+async fn udp_session(
+    e: Arc<Engine>,
+    a: Arc<ArcSwap<Active>>,
+    cursor: Arc<AtomicUsize>,
+    front: Arc<UdpSocket>,
+    client: SocketAddr,
+    mut rx: mpsc::Receiver<Packet>,
+) {
+    let mut selected = None;
+    for t in ordered(&a, &cursor) {
+        if let Ok(ip) = e.resolver.resolve(&t.host).await {
+            selected = Some((t, ip));
+            break;
+        }
+    }
+    let Some((target, mut ip)) = selected else {
+        return;
+    };
+    async fn connect(ip: IpAddr, port: u16) -> Result<UdpSocket> {
+        let s = UdpSocket::bind(if ip.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).await?;
+        s.connect((ip, port)).await?;
+        Ok(s)
+    }
+    let Ok(mut backend) = connect(ip, target.port).await else {
+        return;
+    };
+    let mut checked = Instant::now();
+    let mut last = Instant::now();
+    let mut buf = vec![0u8; 65535];
+    loop {
+        tokio::select! {
+         _=tokio::time::sleep_until((last+Duration::from_secs(30)).into())=>break,
+         packet=rx.recv()=>{let Some((data,_bytes))=packet else{break};
+          if checked.elapsed()>=e.resolver.ttl {
+           let Ok(new_ip)=e.resolver.resolve(&target.host).await else{break};
+           if new_ip!=ip{let Ok(s)=connect(new_ip,target.port).await else{break};backend=s;ip=new_ip;}checked=Instant::now();
+          }
+          if let Ok(Ok(n))=tokio::time::timeout(Duration::from_secs(3),backend.send(&data)).await{a.load().meter.add(n,true);last=Instant::now();}else{break}
+         },
+         r=backend.recv(&mut buf)=>{let Ok(n)=r else{break};if let Ok(Ok(w))=tokio::time::timeout(Duration::from_secs(3),front.send_to(&buf[..n],client)).await{a.load().meter.add(w,false);last=Instant::now();}else{break}}
+        }
+    }
+}

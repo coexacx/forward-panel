@@ -1,0 +1,32 @@
+[Unit]
+Description=Vistart forwarding agent (Rust)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/var/lib/vistart-agent/config.json
+[Service]
+Type=simple
+User=vistart-agent
+Group=vistart-agent
+ExecStart=/opt/vistart-agent/current -config /var/lib/vistart-agent/config.json
+Restart=on-failure
+RestartSec=5
+WorkingDirectory=/var/lib/vistart-agent
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+ReadWritePaths=/var/lib/vistart-agent
+MemoryMax=128M
+TasksMax=128
+LimitNOFILE=4096
+TimeoutStopSec=15
+[Install]
+WantedBy=multi-user.target
