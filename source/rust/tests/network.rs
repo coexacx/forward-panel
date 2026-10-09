@@ -330,3 +330,134 @@ async fn incremental_changes_preserve_unrelated_live_connections() {
     drop(j);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+async fn counts(e: &Engine, rule: &str, tcp: u32, udp: u32) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let c = e.rule_connections().await;
+            if c.get(rule).is_some_and(|c| c.tcp == tcp && c.udp == udp) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("unexpected connection count for {rule}: expected TCP {tcp}, UDP {udp}")
+    });
+}
+async fn tcp_peer(port: u16) -> TcpStream {
+    let mut c = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    c.write_all(b"x").await.unwrap();
+    let mut b = [0u8; 1];
+    c.read_exact(&mut b).await.unwrap();
+    assert_eq!(b, *b"x");
+    c
+}
+async fn udp_peer(port: u16) -> UdpSocket {
+    let c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    c.connect(("127.0.0.1", port)).await.unwrap();
+    // Several packets from one source are one session, never several connections.
+    for _ in 0..3 {
+        c.send(b"udp").await.unwrap();
+        let mut b = [0u8; 3];
+        let n = tokio::time::timeout(Duration::from_secs(2), c.recv(&mut b))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&b[..n], b"udp");
+    }
+    c
+}
+#[tokio::test]
+async fn live_rule_counts_survive_refresh_and_release_on_idle_close_and_retarget() {
+    let dir = std::env::temp_dir().join(format!("forward-counts-{}", id()));
+    std::fs::create_dir(&dir).unwrap();
+    let j = Journal::open(&dir.join("traffic.json")).unwrap();
+    let e = Engine::new(
+        j.clone(),
+        Arc::new(Resolver::new(vec!["127.0.0.0/8".parse().unwrap()], vec![])),
+        16,
+        16,
+    );
+    let target = echo().await;
+    let mut config = Config {
+        version: 1,
+        valid_for_seconds: 30,
+        ..Default::default()
+    };
+    for id in ["a", "b", "failed"] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        config.rules.push(Rule {
+            id: id.into(),
+            lease_id: "same-lease".into(),
+            cycle_id: "cycle".into(),
+            listen_ip: "127.0.0.1".into(),
+            listen_port: listener.local_addr().unwrap().port(),
+            target_host: "127.0.0.1".into(),
+            target_port: target,
+            expires_at: now() + 300,
+            ..Default::default()
+        });
+    }
+    let unavailable = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    config.rules[2].target_port = unavailable.local_addr().unwrap().port();
+    drop(unavailable);
+    assert!(e.apply(&config).await.is_empty());
+    counts(&e, "a", 0, 0).await;
+    let mut a1 = tcp_peer(config.rules[0].listen_port).await;
+    let a2 = tcp_peer(config.rules[0].listen_port).await;
+    let mut b = tcp_peer(config.rules[1].listen_port).await;
+    let _u1 = udp_peer(config.rules[0].listen_port).await;
+    let _u2 = udp_peer(config.rules[0].listen_port).await;
+    let _u3 = udp_peer(config.rules[1].listen_port).await;
+    counts(&e, "a", 2, 2).await;
+    counts(&e, "b", 1, 1).await;
+    let mut failed = TcpStream::connect(("127.0.0.1", config.rules[2].listen_port))
+        .await
+        .unwrap();
+    let mut buf = [0u8; 1];
+    let closed = tokio::time::timeout(Duration::from_secs(2), failed.read(&mut buf))
+        .await
+        .unwrap();
+    assert!(closed.is_err() || closed.unwrap() == 0);
+    counts(&e, "failed", 0, 0).await;
+    config.rules[0].cycle_id = "next-cycle".into();
+    config.rules[0].expires_at += 30;
+    assert!(e.apply(&config).await.is_empty());
+    counts(&e, "a", 2, 2).await;
+    drop(a2);
+    counts(&e, "a", 1, 2).await;
+    // Keep the config lease alive while the real UDP idle timer expires.
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(e.apply(&config).await.is_empty());
+    }
+    counts(&e, "a", 1, 0).await;
+    counts(&e, "b", 1, 0).await;
+    // Background TCP target probes do not inflate connection counts.
+    a1.write_all(b"x").await.unwrap();
+    a1.read_exact(&mut buf).await.unwrap();
+    config.rules.retain(|r| r.id != "b");
+    assert!(e.apply(&config).await.is_empty());
+    assert!(!e.rule_connections().await.contains_key("b"));
+    let closed = tokio::time::timeout(Duration::from_secs(2), b.read(&mut buf))
+        .await
+        .unwrap();
+    assert!(closed.is_err() || closed.unwrap() == 0);
+    counts(&e, "a", 1, 0).await;
+    config.rules[0].target_port = echo().await;
+    assert!(e.apply(&config).await.is_empty());
+    counts(&e, "a", 0, 0).await;
+    let closed = tokio::time::timeout(Duration::from_secs(2), a1.read(&mut buf))
+        .await
+        .unwrap();
+    assert!(closed.is_err() || closed.unwrap() == 0);
+    let _new = tcp_peer(config.rules[0].listen_port).await;
+    counts(&e, "a", 1, 0).await;
+    e.close().await;
+    assert!(e.rule_connections().await.is_empty());
+    drop(e);
+    drop(j);
+    std::fs::remove_dir_all(dir).unwrap();
+}

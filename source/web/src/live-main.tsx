@@ -1082,7 +1082,7 @@ function App() {
         <Box>
           {toolbar()}
           {table(
-            ["节点 / 连接地址", "目标地址", "所属套餐", "状态", "操作"],
+            ["节点 / 连接地址", "目标地址", "所属套餐", "实时连接", "状态", "操作"],
             mine
               .filter((a) =>
                 match(
@@ -1114,6 +1114,9 @@ function App() {
                       {a.remark && <small>{a.remark}</small>}
                     </td>
                     <td>{l.plan_name}</td>
+                    <td>
+                      <RuleConnections allocation={a} now={data.now + Math.max(0, probeNow - data.receivedAt) / 1000} />
+                    </td>
                     <td>
                       <Tag good={a.apply_status === "listening"} warn={forwardingWarn(a)}>
                         {leaseState(l) !== "使用中" ? leaseState(l) : forwardingLabel(a)}
@@ -1719,7 +1722,7 @@ function App() {
         <Box>
           {toolbar("搜索用户、节点、地址或备注")}
           {table(
-            ["用户 / 套餐", "入口地址", "目标地址", "状态", "操作"],
+            ["用户 / 套餐", "入口地址", "目标地址", "实时连接", "状态", "操作"],
             ports
               .filter((a) => {
                 const l = leases.find((l) => l.id === a.lease_id);
@@ -1754,6 +1757,9 @@ function App() {
                         }
                       />
                       {a.remark && <small>{a.remark}</small>}
+                    </td>
+                    <td>
+                      <RuleConnections allocation={a} now={data.now + Math.max(0, probeNow - data.receivedAt) / 1000} />
                     </td>
                     <td>
                       <Tag good={a.apply_status === "listening"} warn={forwardingWarn(a)}>
@@ -3985,6 +3991,23 @@ const checkLabels: Record<string, string> = {
   dns_error: "解析失败",
   blocked: "目标受限",
 };
+function RuleConnections({ allocation: a, now }: { allocation: Any; now: number }) {
+  const c = a.connections;
+  const fresh = c?.status === "ok" && c.updated_at > now - 15 && c.updated_at <= now + 10;
+  const count = (key: "tcp" | "udp") =>
+    fresh && Number.isSafeInteger(c?.[key]) && c[key] >= 0 ? c[key].toLocaleString() : "—";
+  const unavailable = c?.status === "offline" ? "节点离线，暂无实时数据" : "等待 Agent 上报最新连接数";
+  return (
+    <div className="rule-connections" data-rule-id={a.id}>
+      <span title={fresh ? "当前已建立的 TCP 转发连接" : unavailable}>
+        <span>TCP</span><strong>{count("tcp")}</strong>
+      </span>
+      <span title={fresh ? "当前 UDP 活跃会话，连续 30 秒无流量后回收" : unavailable}>
+        <span>UDP</span><strong>{count("udp")}</strong>
+      </span>
+    </div>
+  );
+}
 function TargetAddresses({
   allocation: a,
   now,

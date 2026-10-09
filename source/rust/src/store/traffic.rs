@@ -35,6 +35,12 @@ impl Store {
                 .target_checks
                 .as_ref()
                 .is_some_and(|v| v.len() > 8192)
+            || r.probe.rule_connections.as_ref().is_some_and(|counts| {
+                counts.len() > 512
+                    || counts
+                        .iter()
+                        .any(|(id, c)| !valid_id(id) || c.tcp > 65_536 || c.udp > 16_384)
+            })
             || !r.probe.cpu_percent.is_finite()
             || !(0.0..=100.0).contains(&r.probe.cpu_percent)
             || r.probe.memory_used > r.probe.memory_total
@@ -126,53 +132,59 @@ impl Store {
             exec(&mut tx,"INSERT INTO vp_cursors VALUES(?,?,?,?,?,?) ON DUPLICATE KEY UPDATE up=VALUES(up),down=VALUES(down)",&[json!(node),json!(r.epoch),json!(c.rule_id),json!(c.cycle_id),json!(c.up),json!(c.down)]).await?;
         }
         let mut probe = r.probe.clone();
-        if let Some(checks) = &r.probe.target_checks {
+        if r.probe.target_checks.is_some() || r.probe.rule_connections.is_some() {
             let targets = rows(
                 &mut tx,
                 &format!("{ALLOCATION} WHERE a.node_id=? AND a.released=0 AND a.target_host<>''"),
                 &[json!(node)],
             )
             .await?;
-            let mut wanted = HashSet::new();
-            for a in targets {
-                let ts: Vec<Target> = if b(&a, "load_balance") {
-                    serde_json::from_value(a["targets"].clone())?
-                } else {
-                    vec![Target {
-                        host: s(&a, "target_host").into(),
-                        port: n(&a, "target_port") as u16,
-                    }]
-                };
-                for t in ts {
-                    wanted.insert((s(&a, "id").to_owned(), t.host, t.port));
-                }
+            if let Some(counts) = &mut probe.rule_connections {
+                let owned: HashSet<_> = targets.iter().map(|a| s(a, "id")).collect();
+                counts.retain(|id, _| owned.contains(id.as_str()));
             }
-            let mut clean = Vec::new();
-            for c in checks {
-                if !valid_id(&c.rule_id)
-                    || !valid_target(&c.host, c.port)
-                    || c.checked_at < 1
-                    || c.checked_at > 253402300799
-                    || !c.latency_ms.is_finite()
-                    || !(0.0..=10000.0).contains(&c.latency_ms)
-                    || ![
-                        "ok",
-                        "timeout",
-                        "refused",
-                        "unreachable",
-                        "dns_error",
-                        "blocked",
-                    ]
-                    .contains(&c.status.as_str())
-                    || c.status != "ok" && c.latency_ms != 0.0
-                {
-                    return Err(invalid());
+            if let Some(checks) = &r.probe.target_checks {
+                let mut wanted = HashSet::new();
+                for a in targets {
+                    let ts: Vec<Target> = if b(&a, "load_balance") {
+                        serde_json::from_value(a["targets"].clone())?
+                    } else {
+                        vec![Target {
+                            host: s(&a, "target_host").into(),
+                            port: n(&a, "target_port") as u16,
+                        }]
+                    };
+                    for t in ts {
+                        wanted.insert((s(&a, "id").to_owned(), t.host, t.port));
+                    }
                 }
-                if wanted.remove(&(c.rule_id.clone(), c.host.clone(), c.port)) {
-                    clean.push(c.clone())
+                let mut clean = Vec::new();
+                for c in checks {
+                    if !valid_id(&c.rule_id)
+                        || !valid_target(&c.host, c.port)
+                        || c.checked_at < 1
+                        || c.checked_at > 253402300799
+                        || !c.latency_ms.is_finite()
+                        || !(0.0..=10000.0).contains(&c.latency_ms)
+                        || ![
+                            "ok",
+                            "timeout",
+                            "refused",
+                            "unreachable",
+                            "dns_error",
+                            "blocked",
+                        ]
+                        .contains(&c.status.as_str())
+                        || c.status != "ok" && c.latency_ms != 0.0
+                    {
+                        return Err(invalid());
+                    }
+                    if wanted.remove(&(c.rule_id.clone(), c.host.clone(), c.port)) {
+                        clean.push(c.clone())
+                    }
                 }
+                probe.target_checks = Some(clean);
             }
-            probe.target_checks = Some(clean);
         }
         exec(
             &mut tx,

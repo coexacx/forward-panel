@@ -1758,3 +1758,8 @@ input::placeholder {
 .impact-leases .details dd {overflow-wrap:anywhere;}
 .impact-preview .form-footer {flex-wrap:wrap;}
 @media(max-width:600px){.limit-fields{grid-template-columns:1fr}.impact-leases details{padding:10px}.impact-preview .form-footer .button{flex:1}}
+
+.rule-connections {display:grid;gap:5px;min-width:74px;font-variant-numeric:tabular-nums;}
+.rule-connections > span {display:flex;align-items:baseline;justify-content:space-between;gap:16px;white-space:nowrap;}
+.rule-connections > span > span {font-size:11px;color:var(--muted);letter-spacing:.03em;}
+.rule-connections strong {font-weight:600;}

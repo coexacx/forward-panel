@@ -150,6 +150,138 @@ async fn mysql_business_and_protocol_parity() {
             .await
             .is_err()
     );
+
+    // Connection telemetry must be bounded, replay-safe and scoped to this node's rules.
+    let stats_epoch = id();
+    let mut stats = Report {
+        version: 1,
+        epoch: stats_epoch,
+        sequence: 1,
+        probe: Probe {
+            rule_connections: Some(
+                [
+                    (
+                        aid.to_owned(),
+                        vistart_forward::protocol::RuleConnections { tcp: 7, udp: 4 },
+                    ),
+                    (
+                        id(),
+                        vistart_forward::protocol::RuleConnections { tcp: 99, udp: 99 },
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    db.report(anode, &stats).await.unwrap();
+    let snap = db.snapshot().await.unwrap();
+    let node = snap["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| s(n, "id") == anode)
+        .unwrap();
+    assert_eq!(
+        node["probe"]["rule_connections"].as_object().unwrap().len(),
+        1
+    );
+    assert_eq!(node["probe"]["rule_connections"][aid]["tcp"], 7);
+    stats
+        .probe
+        .rule_connections
+        .as_mut()
+        .unwrap()
+        .get_mut(aid)
+        .unwrap()
+        .tcp = 8;
+    db.report(anode, &stats).await.unwrap(); // duplicate sequence cannot change live stats
+    let snap = db.snapshot().await.unwrap();
+    let node = snap["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| s(n, "id") == anode)
+        .unwrap();
+    assert_eq!(node["probe"]["rule_connections"][aid]["tcp"], 7);
+    stats.sequence = 2;
+    stats
+        .probe
+        .rule_connections
+        .as_mut()
+        .unwrap()
+        .get_mut(aid)
+        .unwrap()
+        .tcp = 65_537;
+    assert!(db.report(anode, &stats).await.is_err());
+    stats
+        .probe
+        .rule_connections
+        .as_mut()
+        .unwrap()
+        .get_mut(aid)
+        .unwrap()
+        .tcp = 1;
+    stats
+        .probe
+        .rule_connections
+        .as_mut()
+        .unwrap()
+        .get_mut(aid)
+        .unwrap()
+        .udp = 16_385;
+    assert!(db.report(anode, &stats).await.is_err());
+    stats
+        .probe
+        .rule_connections
+        .as_mut()
+        .unwrap()
+        .get_mut(aid)
+        .unwrap()
+        .udp = 1;
+    db.report(wrong_node, &stats).await.unwrap();
+    let snap = db.snapshot().await.unwrap();
+    let node = snap["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| s(n, "id") == *wrong_node)
+        .unwrap();
+    assert!(
+        node["probe"]["rule_connections"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+    stats.probe.rule_connections = Some((0..513).map(|_| (id(), Default::default())).collect());
+    assert!(db.report(anode, &stats).await.is_err());
+    stats.probe.rule_connections = Some(
+        [("../invalid".into(), Default::default())]
+            .into_iter()
+            .collect(),
+    );
+    assert!(db.report(anode, &stats).await.is_err());
+    assert!(
+        serde_json::from_value::<Report>(
+            json!({"probe":{"rule_connections":{"a":{"tcp":-1,"udp":0}}}})
+        )
+        .is_err()
+    );
+    stats.probe.rule_connections = None;
+    db.report(anode, &stats).await.unwrap();
+    let snap = db.snapshot().await.unwrap();
+    let node = snap["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| s(n, "id") == anode)
+        .unwrap();
+    assert!(node["probe"]["rule_connections"].is_null());
+    eprintln!(
+        "PASS: per-rule metrics ownership, bounds, duplicate report and old-agent compatibility"
+    );
     let epoch2 = id();
     db.report(bnode, &report(&epoch2, 1, bid, cycle, 400, 250))
         .await

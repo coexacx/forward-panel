@@ -108,9 +108,16 @@ pub struct TargetCheck {
     pub latency_ms: f64,
     pub checked_at: i64,
 }
+/// Active forwarded TCP streams and UDP peer sessions, never cumulative totals.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuleConnections {
+    pub tcp: u32,
+    pub udp: u32,
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Probe {
+    pub rule_connections: Option<std::collections::BTreeMap<String, RuleConnections>>,
     pub target_checks: Option<Vec<TargetCheck>>,
     pub cpu_percent: f64,
     pub memory_used: u64,

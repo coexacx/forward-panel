@@ -24,7 +24,7 @@ bash /tmp/forward-panel-install.sh
 ~~~text
   Vistart 转发面板  /  管理
   ──────────────────────────────
-  版本  0.3.2    状态  运行中
+  版本  0.3.3    状态  运行中
   地址  http://服务器IP:19280
 
   维护
@@ -67,3 +67,5 @@ bash /tmp/forward-panel-install.sh
 HTTP 的 IP:端口入口适合首次部署检查；HTTP 不加密，正式登录和节点管理应使用 HTTPS。主控与节点之间不接受明文 WS。
 
 下载从 GitHub Releases 获取；安装器与远程部署器校验 Ed25519 签名、SHA-256 和文件大小。签名私钥不在仓库中。
+
+每条规则支持实时 TCP / UDP 连接统计，见[连接统计说明](docs/连接统计.md)。

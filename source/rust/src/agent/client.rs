@@ -220,6 +220,7 @@ async fn session(
         r.supports_limits = true;
         r.lease_usage = e.lease_usage();
         r.probe = sampler.sample();
+        r.probe.rule_connections = Some(e.rule_connections().await);
         r.probe.target_checks = Some(e.target_checks().await);
         r.decommission_ack = decommission.clone();
         let exchange = async {

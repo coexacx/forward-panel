@@ -25,6 +25,7 @@ pub async fn snapshot(ctx: &Context<'_>, admin: bool) -> Result<Value> {
         .collect();
     let revision = n(&state, "revision");
     let mut samples = HashMap::<(String, String, String, i64), Value>::new();
+    let mut connections = HashMap::<String, Value>::new();
     for node in state["nodes"].as_array_mut().unwrap() {
         node["meta"] = meta.get(s(node, "id")).cloned().unwrap_or(json!({}));
         node["meta"]["has_ssh_password"] = json!(!s(&node["meta"], "ssh_secret").is_empty());
@@ -53,8 +54,13 @@ pub async fn snapshot(ctx: &Context<'_>, admin: bool) -> Result<Value> {
                 );
             }
         }
+        let node_id = s(node, "id").to_owned();
         if let Some(p) = node["probe"].as_object_mut() {
             p.remove("target_checks");
+            // Shared node probes must never expose other tenants' rule IDs or counts.
+            if let Some(counts) = p.remove("rule_connections") {
+                connections.insert(node_id, counts);
+            }
         }
     }
     let nodes: HashMap<String, Value> = state["nodes"]
@@ -133,6 +139,7 @@ pub async fn snapshot(ctx: &Context<'_>, admin: bool) -> Result<Value> {
             "accepted"
         };
         a["apply_status"] = json!(apply_status);
+        a["connections"] = rule_connections(node, s(a, "id"), connections.get(s(a, "node_id")));
         let status = match apply_status {
             "listening" | "accepted" => {
                 if b(node, "tcping_supported") {
@@ -292,4 +299,47 @@ pub async fn snapshot(ctx: &Context<'_>, admin: bool) -> Result<Value> {
     state["user"] = safe_account(user.clone());
     state["now"] = json!(now());
     Ok(state)
+}
+
+fn rule_connections(node: &Value, id: &str, reported: Option<&Value>) -> Value {
+    let mut out =
+        json!({"tcp":null,"udp":null,"status":"unknown","updated_at":n(node,"last_seen")});
+    if !b(node, "online") {
+        out["status"] = json!("offline");
+        return out;
+    }
+    let Some(counts) = reported.and_then(Value::as_object) else {
+        return out;
+    };
+    if let Some(c) = counts.get(id) {
+        out["tcp"] = c["tcp"].clone();
+        out["udp"] = c["udp"].clone();
+        out["status"] = json!("ok");
+    } else if node["active_rules"]
+        .as_array()
+        .is_some_and(|ids| !ids.iter().any(|v| v == id))
+    {
+        out["tcp"] = json!(0);
+        out["udp"] = json!(0);
+        out["status"] = json!("ok");
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn connection_display_distinguishes_zero_unknown_and_offline() {
+        let mut node = json!({"online":true,"last_seen":123,"active_rules":["a"]});
+        let stats = json!({"a":{"tcp":3,"udp":2}});
+        assert_eq!(rule_connections(&node, "a", Some(&stats))["tcp"], 3);
+        assert_eq!(rule_connections(&node, "b", Some(&stats))["tcp"], 0);
+        assert!(rule_connections(&node, "a", None)["tcp"].is_null());
+        assert!(rule_connections(&node, "a", Some(&json!({})))["tcp"].is_null());
+        node["online"] = json!(false);
+        let stale = rule_connections(&node, "a", Some(&stats));
+        assert_eq!(stale["status"], "offline");
+        assert!(stale["tcp"].is_null());
+    }
 }

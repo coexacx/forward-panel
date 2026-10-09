@@ -7,11 +7,11 @@ use crate::{now, protocol::*, valid_id, valid_target};
 use anyhow::{Result, bail};
 use arc_swap::ArcSwap;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     net::{IpAddr, SocketAddr},
     sync::{
         Arc,
-        atomic::{AtomicI64, AtomicUsize, Ordering},
+        atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -22,10 +22,37 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
+#[derive(Default)]
+struct Connections {
+    tcp: Arc<AtomicU32>,
+    udp: Arc<AtomicU32>,
+}
+impl Connections {
+    fn snapshot(&self) -> RuleConnections {
+        RuleConnections {
+            tcp: self.tcp.load(Ordering::Relaxed),
+            udp: self.udp.load(Ordering::Relaxed),
+        }
+    }
+}
+// Dropping a forwarding task (including cancellation/errors) always releases its gauge.
+struct ConnectionGuard(Arc<AtomicU32>);
+impl ConnectionGuard {
+    fn enter(count: Arc<AtomicU32>) -> Self {
+        count.fetch_add(1, Ordering::Relaxed);
+        Self(count)
+    }
+}
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 struct Active {
     rule: Rule,
     meter: Arc<Meter>,
     gate: Arc<Gate>,
+    connections: Arc<Connections>,
 }
 struct Forward {
     active: Arc<ArcSwap<Active>>,
@@ -190,6 +217,7 @@ impl Engine {
                         rule: r.clone(),
                         meter: self.journal.meter(&r.id, &r.cycle_id),
                         gate: old.gate.clone(),
+                        connections: old.connections.clone(),
                     }));
                 }
                 continue;
@@ -226,6 +254,7 @@ impl Engine {
         let active = Arc::new(ArcSwap::from_pointee(Active {
             meter: self.journal.meter(&r.id, &r.cycle_id),
             gate: self.leases.lock().unwrap()[&r.lease_id].clone(),
+            connections: Arc::new(Connections::default()),
             rule: r,
         }));
         let cancel = CancellationToken::new();
@@ -266,6 +295,15 @@ impl Engine {
             .collect();
         ids.sort();
         ids
+    }
+    pub async fn rule_connections(&self) -> BTreeMap<String, RuleConnections> {
+        self.rules
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, f)| !f.task.is_finished() && !f.cancel.is_cancelled())
+            .map(|(id, f)| (id.clone(), f.active.load().connections.snapshot()))
+            .collect()
     }
     pub async fn target_checks(&self) -> Vec<TargetCheck> {
         self.checks.lock().await.clone()
@@ -406,6 +444,7 @@ async fn stream(
     let Ok(Ok(mut remote)) = tokio::time::timeout(Duration::from_secs(8), dial).await else {
         return;
     };
+    let _connection = ConnectionGuard::enter(a.load().connections.tcp.clone());
     tune(&client);
     tune(&remote);
     let (cr, cw) = client.split();
@@ -504,6 +543,7 @@ async fn udp_session(
     let Ok(mut backend) = connect(ip, target.port).await else {
         return;
     };
+    let _connection = ConnectionGuard::enter(a.load().connections.udp.clone());
     let mut checked = Instant::now();
     let mut last = Instant::now();
     let mut buf = vec![0u8; 65535];
