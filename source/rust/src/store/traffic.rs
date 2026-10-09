@@ -9,6 +9,19 @@ impl Store {
             || r.sequence > i64::MAX as u64
             || r.counters.len() > 1000
             || r.errors.len() > 512
+            || r.active_rules.as_ref().is_some_and(|ids| {
+                ids.len() > 512
+                    || ids.iter().any(|id| !valid_id(id))
+                    || ids.iter().collect::<HashSet<_>>().len() != ids.len()
+            })
+            || r.applied_rules.as_ref().is_some_and(|rules| {
+                rules.len() > 512
+                    || rules.iter().any(|(id, hash)| {
+                        !valid_id(id)
+                            || hash.len() != 64
+                            || !hash.bytes().all(|b| b.is_ascii_hexdigit())
+                    })
+            })
             || r.probe
                 .target_checks
                 .as_ref()
@@ -158,7 +171,7 @@ impl Store {
             &[json!(node), json!(r.epoch), json!(r.sequence)],
         )
         .await?;
-        exec(&mut tx,"UPDATE vp_nodes SET last_seen=?,applied_revision=?,probe=?,errors=?,agent_version=?,kernel_version=? WHERE id=?",&[json!(now()),json!(r.applied_revision),json!(probe),json!(r.errors),json!(r.agent_version),json!(r.kernel_version),json!(node)]).await?;
+        exec(&mut tx,"UPDATE vp_nodes SET last_seen=?,applied_revision=?,probe=?,errors=?,agent_version=?,kernel_version=?,active_rules=?,applied_rules=? WHERE id=?",&[json!(now()),json!(r.applied_revision),json!(probe),json!(r.errors),json!(r.agent_version),json!(r.kernel_version),r.active_rules.as_ref().map(|v|json!(v)).unwrap_or(Value::Null),r.applied_rules.as_ref().map(|v|json!(v)).unwrap_or(Value::Null),json!(node)]).await?;
         if changed {
             bump(&mut tx).await?
         }

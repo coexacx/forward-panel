@@ -11,6 +11,8 @@ use std::{collections::HashSet, fmt, sync::Arc};
 use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 mod billing;
+mod lifecycle;
+mod migration;
 mod traffic;
 #[derive(Debug)]
 pub struct Fault {
@@ -113,7 +115,17 @@ pub async fn rows(db: &mut MySqlConnection, sql: &str, args: &[Value]) -> Result
                 json!(row.try_get::<f64, _>(i)?)
             } else {
                 let text = row.try_get_unchecked::<String, _>(i)?;
-                if ["node_ids", "targets", "probe", "errors", "snapshot"].contains(&k) {
+                if [
+                    "node_ids",
+                    "targets",
+                    "probe",
+                    "errors",
+                    "snapshot",
+                    "active_rules",
+                    "applied_rules",
+                ]
+                .contains(&k)
+                {
                     serde_json::from_str(&text)?
                 } else {
                     json!(text)
@@ -157,11 +169,11 @@ async fn audit(db: &mut MySqlConnection, event: &str, subject: &str, detail: &st
     .await?;
     Ok(())
 }
-const PLAN: &str = "SELECT id,name,port_limit,traffic_limit AS traffic_limit_bytes,period_days,price_cents,reset_price_cents,node_ids,enabled FROM vp_plans";
-const LEASE: &str = "SELECT l.id,l.user_id,l.plan_id,l.plan_name,l.port_limit,l.traffic_limit AS traffic_limit_bytes,l.period_days,l.node_ids,l.expires_at,l.next_reset_at,l.current_cycle AS cycle_id,l.manual_paused,l.ended,c.up AS used_up,c.down AS used_down,(SELECT COUNT(*) FROM vp_allocations a WHERE a.lease_id=l.id AND a.released=0) AS used_ports FROM vp_leases l JOIN vp_cycles c ON c.id=l.current_cycle";
+const PLAN: &str = "SELECT id,name,port_limit,traffic_limit AS traffic_limit_bytes,period_days,price_cents,reset_price_cents,node_ids,enabled,deleted FROM vp_plans";
+const LEASE: &str = "SELECT l.id,l.user_id,l.plan_id,l.plan_name,l.port_limit,l.traffic_limit AS traffic_limit_bytes,l.period_days,l.node_ids,l.expires_at,l.next_reset_at,l.current_cycle AS cycle_id,l.manual_paused,l.ended,l.deleted,c.up AS used_up,c.down AS used_down,(SELECT COUNT(*) FROM vp_allocations a WHERE a.lease_id=l.id AND a.released=0) AS used_ports FROM vp_leases l JOIN vp_cycles c ON c.id=l.current_cycle";
 const ALLOCATION: &str = "SELECT a.id,a.lease_id,a.node_id,a.public_ip,a.bind_ip,a.port,a.target_host,a.target_port,a.released,COALESCE(t.targets,'[]') AS targets FROM vp_allocations a LEFT JOIN vp_allocation_targets t ON t.rule_id=a.id";
 const ORDER: &str = "SELECT id,user_id,plan_id,lease_id,kind,amount_cents,status,created_at,paid_at,snapshot FROM vp_orders";
-const NODES: &str = "SELECT n.id,n.name,n.enabled,n.last_seen,n.applied_revision,n.probe,n.errors,n.agent_version,n.kernel_version,COALESCE(d.status,'') AS removal_status FROM vp_nodes n LEFT JOIN vp_node_removals d ON d.node_id=n.id WHERE n.deleted=0";
+const NODES: &str = "SELECT n.id,n.name,n.enabled,n.last_seen,n.applied_revision,n.probe,n.errors,n.active_rules,n.applied_rules,n.agent_version,n.kernel_version,COALESCE(d.status,'') AS removal_status FROM vp_nodes n LEFT JOIN vp_node_removals d ON d.node_id=n.id WHERE n.deleted=0";
 async fn lease(db: &mut MySqlConnection, id: &str) -> Result<Value> {
     one(db, &format!("{LEASE} WHERE l.id=?"), &[json!(id)]).await
 }
@@ -175,7 +187,8 @@ async fn order(db: &mut MySqlConnection, id: &str) -> Result<Value> {
     one(db, &format!("{ORDER} WHERE id=?"), &[json!(id)]).await
 }
 async fn usable(db: &mut MySqlConnection, l: &Value) -> Result<bool> {
-    Ok(!b(l, "ended")
+    Ok(!b(l, "deleted")
+        && !b(l, "ended")
         && !b(l, "manual_paused")
         && n(l, "expires_at") > now()
         && (n(l, "traffic_limit_bytes") == 0
@@ -228,6 +241,17 @@ impl Store {
         exec(&mut db,"CREATE TABLE IF NOT EXISTS vp_node_removals(node_id VARCHAR(80) COLLATE utf8mb4_bin PRIMARY KEY,nonce VARCHAR(80) NOT NULL,status VARCHAR(30) NOT NULL,requested_at BIGINT NOT NULL,FOREIGN KEY(node_id) REFERENCES vp_nodes(id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",&[]).await?;
         // Probe reports can contain up to 8,192 checks, which exceed a TEXT column.
         if count(&mut db,"SELECT COUNT(*) AS n FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='vp_nodes' AND column_name='probe' AND data_type='text'",&[]).await?==1{exec(&mut db,"ALTER TABLE vp_nodes MODIFY probe MEDIUMTEXT NOT NULL",&[]).await?;}
+        for table in ["vp_plans", "vp_leases"] {
+            if count(&mut db, "SELECT COUNT(*) n FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name=? AND column_name='deleted'", &[json!(table)]).await? == 0 {
+                exec(&mut db, &format!("ALTER TABLE {table} ADD COLUMN deleted BOOLEAN NOT NULL DEFAULT 0"), &[]).await?;
+            }
+        }
+        if count(&mut db, "SELECT COUNT(*) n FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='vp_nodes' AND column_name='active_rules'", &[]).await? == 0 {
+            exec(&mut db, "ALTER TABLE vp_nodes ADD COLUMN active_rules MEDIUMTEXT NULL", &[]).await?;
+        }
+        if count(&mut db, "SELECT COUNT(*) n FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='vp_nodes' AND column_name='applied_rules'", &[]).await? == 0 {
+            exec(&mut db, "ALTER TABLE vp_nodes ADD COLUMN applied_rules MEDIUMTEXT NULL", &[]).await?;
+        }
         drop(db);
         Ok(Arc::new(Self {
             pool,
@@ -263,9 +287,9 @@ impl Store {
             &[],
         )
         .await?;
-        let plans = rows(&mut tx, PLAN, &[]).await?;
-        let leases = rows(&mut tx, LEASE, &[]).await?;
-        let allocations = rows(&mut tx, ALLOCATION, &[]).await?;
+        let plans = rows(&mut tx, &format!("{PLAN} WHERE deleted=0"), &[]).await?;
+        let leases = rows(&mut tx, &format!("{LEASE} WHERE l.deleted=0"), &[]).await?;
+        let allocations = rows(&mut tx, &format!("{ALLOCATION} WHERE a.released=0"), &[]).await?;
         let orders = rows(&mut tx, &format!("{ORDER} ORDER BY created_at DESC"), &[]).await?;
         let revision = one(
             &mut tx,
@@ -298,6 +322,13 @@ impl Store {
         let cid = s(c, "id");
         let lid = s(c, "lease_id");
         match s(c, "action") {
+            "export-node-rules" => return migration::export(db, c).await,
+            "preview-node-migration" | "import-node-rules" => {
+                return migration::migrate(db, c).await;
+            }
+            "delete-plan" => return lifecycle::delete_plan(db, c).await,
+            "delete-lease" | "admin-delete-lease" => return lifecycle::delete_lease(db, c).await,
+            "edit-node" => return lifecycle::edit_node(db, c).await,
             "user" => {
                 let v = &c["user"];
                 if !valid_id(s(v, "id")) || !name_ok(s(v, "name")) {
@@ -423,12 +454,25 @@ impl Store {
                         return Err(invalid());
                     }
                 }
-                exec(db,"INSERT INTO vp_plans VALUES(?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE name=VALUES(name),port_limit=VALUES(port_limit),traffic_limit=VALUES(traffic_limit),period_days=VALUES(period_days),price_cents=VALUES(price_cents),reset_price_cents=VALUES(reset_price_cents),node_ids=VALUES(node_ids),enabled=VALUES(enabled)",&["id","name","port_limit","traffic_limit_bytes","period_days","price_cents","reset_price_cents","node_ids","enabled"].iter().map(|k|p[*k].clone()).collect::<Vec<_>>()).await?;
+                if count(
+                    db,
+                    "SELECT COUNT(*) n FROM vp_plans WHERE id=? AND deleted=1",
+                    &[p["id"].clone()],
+                )
+                .await?
+                    > 0
+                {
+                    return Err(missing());
+                }
+                exec(db,"INSERT INTO vp_plans(id,name,port_limit,traffic_limit,period_days,price_cents,reset_price_cents,node_ids,enabled) VALUES(?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE name=VALUES(name),port_limit=VALUES(port_limit),traffic_limit=VALUES(traffic_limit),period_days=VALUES(period_days),price_cents=VALUES(price_cents),reset_price_cents=VALUES(reset_price_cents),node_ids=VALUES(node_ids),enabled=VALUES(enabled)",&["id","name","port_limit","traffic_limit_bytes","period_days","price_cents","reset_price_cents","node_ids","enabled"].iter().map(|k|p[*k].clone()).collect::<Vec<_>>()).await?;
+                if b(c, "update_existing") {
+                    lifecycle::sync_leases(db, p).await?;
+                }
                 bump(db).await?;
             }
             "grant" => {
                 let p = plan(db, s(c, "plan_id")).await?;
-                if !b(&p, "enabled") {
+                if !b(&p, "enabled") || b(&p, "deleted") {
                     return Err(forbidden());
                 }
                 let l = billing::grant(db, uid, &p).await?;
@@ -438,6 +482,9 @@ impl Store {
             "lease" => return lease(db, lid).await,
             "pause" | "end-lease" | "expiry" => {
                 let l = lease(db, lid).await?;
+                if b(&l, "deleted") {
+                    return Err(missing());
+                }
                 match s(c, "action") {
                     "pause" => {
                         exec(
@@ -676,7 +723,7 @@ impl Store {
                 ..Default::default()
             });
         }
-        let sql = "SELECT a.id,l.user_id,l.id AS lease_id,l.current_cycle AS cycle_id,a.bind_ip AS listen_ip,a.port AS listen_port,a.target_host,a.target_port,l.expires_at,COALESCE(at.targets,'[]') AS targets FROM vp_allocations a LEFT JOIN vp_allocation_targets at ON at.rule_id=a.id JOIN vp_nodes n ON n.id=a.node_id JOIN vp_leases l ON l.id=a.lease_id JOIN vp_cycles c ON c.id=l.current_cycle JOIN vp_users u ON u.id=l.user_id WHERE a.node_id=? AND n.enabled=1 AND n.deleted=0 AND a.released=0 AND a.target_host<>'' AND l.ended=0 AND l.manual_paused=0 AND l.expires_at>? AND u.disabled=0 AND (l.traffic_limit=0 OR c.up+c.down<l.traffic_limit)";
+        let sql = "SELECT a.id,l.user_id,l.id AS lease_id,l.current_cycle AS cycle_id,a.bind_ip AS listen_ip,a.port AS listen_port,a.target_host,a.target_port,l.expires_at,COALESCE(at.targets,'[]') AS targets FROM vp_allocations a LEFT JOIN vp_allocation_targets at ON at.rule_id=a.id JOIN vp_nodes n ON n.id=a.node_id JOIN vp_leases l ON l.id=a.lease_id JOIN vp_cycles c ON c.id=l.current_cycle JOIN vp_users u ON u.id=l.user_id WHERE a.node_id=? AND n.enabled=1 AND n.deleted=0 AND a.released=0 AND a.target_host<>'' AND l.deleted=0 AND l.ended=0 AND l.manual_paused=0 AND l.expires_at>? AND u.disabled=0 AND (l.traffic_limit=0 OR c.up+c.down<l.traffic_limit)";
         let rules = rows(&mut db, sql, &[json!(node), json!(now())])
             .await?
             .into_iter()

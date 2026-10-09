@@ -23,6 +23,7 @@ use tokio::sync::Mutex;
 pub struct Jobs {
     root: PathBuf,
     items: Mutex<BTreeMap<String, Value>>,
+    release: Mutex<Value>,
 }
 impl Jobs {
     pub fn new(root: &Path, _config: Value) -> Result<Arc<Self>> {
@@ -43,6 +44,7 @@ impl Jobs {
         Ok(Arc::new(Self {
             root: root.into(),
             items: Mutex::new(items),
+            release: Mutex::new(json!({"status":"checking","checking":false,"checked_at":0})),
         }))
     }
     async fn save(&self, v: Value) -> Result<()> {
@@ -55,7 +57,54 @@ impl Jobs {
         )
     }
     pub async fn list(&self) -> Vec<Value> {
-        self.items.lock().await.values().cloned().collect()
+        let mut items = self.items.lock().await;
+        let before = items.len();
+        items.retain(|_, v| {
+            !b(v, "done")
+                || if b(v, "ok") {
+                    n(v, "finished_at") > now() - 5
+                } else {
+                    n(v, "at") > now() - 86400
+                }
+        });
+        if items.len() != before {
+            let _ = atomic_write(
+                &self.root.join("state/jobs.json"),
+                &serde_json::to_vec(&*items).unwrap_or_default(),
+                0o600,
+            );
+        }
+        items.values().cloned().collect()
+    }
+    pub async fn release_status(self: &Arc<Self>, force: bool) -> Value {
+        let mut state = self.release.lock().await;
+        let age = now() - n(&state, "checked_at");
+        if !b(&state, "checking") && (age >= 3600 || (force && age >= 30)) {
+            state["checking"] = json!(true);
+            let jobs = self.clone();
+            tokio::spawn(async move {
+                let result = async {
+                    let config: Value = serde_json::from_slice(&std::fs::read(
+                        jobs.root.join("state/controller.json"),
+                    )?)?;
+                    let base = release_base(&config);
+                    let (_, manifest) =
+                        read_manifest(base, &jobs.root.join("state/release-cache")).await?;
+                    Ok::<_, anyhow::Error>(manifest)
+                }
+                .await;
+                let mut state = jobs.release.lock().await;
+                *state = match result {
+                    Ok(m) => {
+                        json!({"status":"ok","version":m["version"],"checked_at":now(),"checking":false})
+                    }
+                    Err(_) => {
+                        json!({"status":"unavailable","message":"版本检查暂不可用，请稍后重试","checked_at":now(),"checking":false})
+                    }
+                };
+            });
+        }
+        state.clone()
     }
     async fn update(&self, job: &mut Value, stage: &str, message: &str) {
         job["stage"] = json!(stage);
@@ -93,6 +142,8 @@ impl Jobs {
             )
             .await;
             req["password"] = Value::Null;
+            req["sealed_password"] = Value::Null;
+            task_job["finished_at"] = json!(now());
             match r {
                 Ok(Ok(result)) => {
                     task_job["result"] = result;
@@ -146,50 +197,8 @@ impl Jobs {
             }
         }
         self.update(job, "connect", "验证 SSH 连接与主机指纹").await;
-        let address = SocketAddr::new(host, n(req, "ssh_port") as u16);
-        let pins = self.root.join("state/ssh-pins");
-        std::fs::create_dir_all(&pins)?;
-        let pin = pins.join(format!(
-            "{}.key",
-            hex::encode(Sha256::digest(address.to_string()))
-        ));
-        let prior = if pin.exists() {
-            Some(std::fs::read_to_string(&pin)?.trim().to_owned())
-        } else {
-            None
-        };
-        let inspected = Arc::new(StdMutex::new(String::new()));
-        let handler = HostKey {
-            prior,
-            inspected: inspected.clone(),
-        };
-        let cfg = client::Config {
-            inactivity_timeout: Some(Duration::from_secs(90)),
-            keepalive_interval: Some(Duration::from_secs(20)),
-            keepalive_max: 3,
-            ..Default::default()
-        };
-        let mut client = tokio::time::timeout(
-            Duration::from_secs(20),
-            client::connect(Arc::new(cfg), address, handler),
-        )
-        .await
-        .context("SSH 连接超时")?
-        .context("SSH 连接或主机指纹校验失败")?;
-        let success = tokio::time::timeout(
-            Duration::from_secs(15),
-            client.authenticate_password(s(req, "username"), s(req, "password")),
-        )
-        .await
-        .context("SSH 认证超时")?
-        .context("SSH 认证失败")?;
-        if !success.success() {
-            bail!("SSH 用户名或密码不正确")
-        }
-        let fingerprint = inspected.lock().unwrap().clone();
-        if !pin.exists() {
-            atomic_write(&pin, format!("{fingerprint}\n").as_bytes(), 0o600)?;
-        }
+        let (client, fingerprint) = connect(&self.root, req).await?;
+        save_connection(store, req, &fingerprint).await?;
         self.update(job, "inspect", "检查系统、架构、权限与可用资源")
             .await;
         let raw=remote(&client,req,"set -eu; . /etc/os-release; printf '%s\\n' \"$ID\"; uname -m; cat /etc/machine-id; awk '/MemTotal/{print $2}' /proc/meminfo; df -Pk / | awk 'NR==2{print $4}'",b"").await.context("系统检查失败")?;
@@ -259,14 +268,17 @@ impl Jobs {
         };
         self.update(job, "download", "下载并验证 Rust Agent 签名")
             .await;
-        let base = if s(&config, "release_url").is_empty() {
-            "https://github.com/coexacx/forward-panel/releases/latest/download"
-        } else {
-            s(&config, "release_url")
-        };
-        let binary = fetch_release(base, arch, &self.root.join("state/release-cache"))
-            .await
-            .context("程序下载或签名校验失败")?;
+        let (binary, expected_version) = fetch_release(
+            release_base(&config),
+            arch,
+            &self.root.join("state/release-cache"),
+        )
+        .await
+        .context("程序下载或签名校验失败")?;
+        if !s(req, "expected_version").is_empty() && s(req, "expected_version") != expected_version
+        {
+            bail!("发布版本已变化，请重新检查后更新")
+        }
         let digest = hex::encode(Sha256::digest(&binary));
         self.update(job, "upload", "上传程序并保留流量日志").await;
         remote(&client,req,"set -eu; getent passwd vistart-agent >/dev/null || useradd --system --home /var/lib/vistart-agent --shell /usr/sbin/nologin vistart-agent; install -d -m 0755 /opt/vistart-agent /opt/vistart-agent/releases; install -d -o vistart-agent -g vistart-agent -m 0700 /var/lib/vistart-agent; umask 077; cat > /opt/vistart-agent/agent.upload", &binary).await.context("程序上传失败")?;
@@ -307,8 +319,41 @@ impl Jobs {
             .await?;
             drop(db);
             if rows.first().is_some_and(|v| {
-                n(v, "last_seen") >= now() - 5 && s(v, "agent_version") == crate::VERSION
+                n(v, "last_seen") >= now() - 5 && s(v, "agent_version") == expected_version
             }) {
+                let _guard = store.writer.lock().await;
+                let mut tx = store.pool.begin().await?;
+                let current = crate::store::rows(
+                    &mut tx,
+                    "SELECT value FROM vp_metadata WHERE id=? FOR UPDATE",
+                    &[req["node_id"].clone()],
+                )
+                .await?;
+                let mut meta: Value = current
+                    .first()
+                    .and_then(|v| serde_json::from_str(s(v, "value")).ok())
+                    .unwrap_or(json!({}));
+                let old_bind = s(&meta, "bind_ip").to_owned();
+                if !old_bind.is_empty() && old_bind != bind {
+                    crate::store::exec(
+                        &mut tx,
+                        "UPDATE vp_pools SET bind_ip=? WHERE node_id=? AND bind_ip=?",
+                        &[json!(bind), req["node_id"].clone(), json!(old_bind)],
+                    )
+                    .await?;
+                    crate::store::exec(&mut tx,"UPDATE vp_allocations SET bind_ip=? WHERE node_id=? AND released=0 AND bind_ip=?",&[json!(bind),req["node_id"].clone(),json!(old_bind)]).await?;
+                    crate::store::exec(
+                        &mut tx,
+                        "UPDATE vp_meta SET value=value+1 WHERE meta_key='revision'",
+                        &[],
+                    )
+                    .await?;
+                }
+                meta.as_object_mut()
+                    .ok_or_else(invalid)?
+                    .extend(result.as_object().unwrap().clone());
+                crate::store::exec(&mut tx, "INSERT INTO vp_metadata(id,value) VALUES(?,?) ON DUPLICATE KEY UPDATE value=VALUES(value)", &[req["node_id"].clone(),meta]).await?;
+                tx.commit().await?;
                 return Ok(result);
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -316,7 +361,7 @@ impl Jobs {
         bail!("程序已安装，但未收到新版 WSS 上报；请检查域名、证书与网络")
     }
 }
-fn validate(v: &Value) -> Result<()> {
+pub fn validate(v: &Value) -> Result<()> {
     let safe = |s: &str| {
         s.parse::<IpAddr>().is_ok_and(|ip| {
             let ip = crate::agent::resolver::unmap(ip);
@@ -436,7 +481,24 @@ async fn remote(
         .context("远程操作超时")?
 }
 const RELEASE_KEY: &str = "KIIxr0QlDRHjO6RTCGNmUJ3tYlbbun2wWTYmaMctbOI=";
-async fn fetch_release(base: &str, arch: &str, cache: &Path) -> Result<Vec<u8>> {
+async fn get(client: &reqwest::Client, url: &str, limit: usize) -> Result<Vec<u8>> {
+    use futures_util::StreamExt;
+    let resp = client.get(url).send().await?.error_for_status()?;
+    if resp.content_length().is_some_and(|n| n > limit as u64) {
+        bail!("release response too large")
+    }
+    let mut out = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if out.len() + chunk.len() > limit {
+            bail!("release response too large")
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+async fn read_manifest(base: &str, cache: &Path) -> Result<(reqwest::Client, Value)> {
     let u = url::Url::parse(base)?;
     if u.scheme() != "https"
         || u.host_str().is_none()
@@ -474,23 +536,6 @@ async fn fetch_release(base: &str, arch: &str, cache: &Path) -> Result<Vec<u8>> 
             }
         }))
         .build()?;
-    async fn get(client: &reqwest::Client, url: &str, limit: usize) -> Result<Vec<u8>> {
-        use futures_util::StreamExt;
-        let resp = client.get(url).send().await?.error_for_status()?;
-        if resp.content_length().is_some_and(|n| n > limit as u64) {
-            bail!("release response too large")
-        }
-        let mut out = Vec::new();
-        let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            if out.len() + chunk.len() > limit {
-                bail!("release response too large")
-            }
-            out.extend_from_slice(&chunk);
-        }
-        Ok(out)
-    }
     let base = base.trim_end_matches('/');
     let raw = get(&client, &format!("{base}/manifest.json"), 65536).await?;
     let signature = get(&client, &format!("{base}/manifest.sig"), 1024).await?;
@@ -517,6 +562,13 @@ async fn fetch_release(base: &str, arch: &str, cache: &Path) -> Result<Vec<u8>> 
     if sequence < prior {
         bail!("release rollback rejected")
     }
+    atomic_write(&seq, sequence.to_string().as_bytes(), 0o600)?;
+    Ok((client, manifest))
+}
+async fn fetch_release(base: &str, arch: &str, cache: &Path) -> Result<(Vec<u8>, String)> {
+    let (client, manifest) = read_manifest(base, cache).await?;
+    let base = base.trim_end_matches('/');
+    let version = s(&manifest, "version");
     let artifact = manifest["artifacts"]
         .as_array()
         .and_then(|a| {
@@ -558,6 +610,180 @@ async fn fetch_release(base: &str, arch: &str, cache: &Path) -> Result<Vec<u8>> 
             v
         }
     };
-    atomic_write(&seq, sequence.to_string().as_bytes(), 0o600)?;
-    Ok(data)
+    Ok((data, version.to_owned()))
+}
+
+pub fn release_base(config: &Value) -> &str {
+    if s(config, "release_url").is_empty() {
+        "https://github.com/coexacx/forward-panel/releases/latest/download"
+    } else {
+        s(config, "release_url")
+    }
+}
+pub fn newer_version(latest: &str, current: &str) -> bool {
+    fn parse(raw: &str) -> Option<Vec<u64>> {
+        let parts: Option<Vec<u64>> = raw.split('.').map(|s| s.parse().ok()).collect();
+        parts.filter(|v| v.len() == 3)
+    }
+    match (parse(latest), parse(current)) {
+        (Some(a), Some(b)) => a > b,
+        _ => false,
+    }
+}
+pub async fn verified_version(root: &Path, config: &Value) -> Result<String> {
+    let (_, manifest) =
+        read_manifest(release_base(config), &root.join("state/release-cache")).await?;
+    Ok(s(&manifest, "version").into())
+}
+fn pin_path(root: &Path, address: SocketAddr) -> PathBuf {
+    root.join("state/ssh-pins").join(format!(
+        "{}.key",
+        hex::encode(Sha256::digest(address.to_string()))
+    ))
+}
+pub async fn inspect_host(root: &Path, req: &Value) -> Result<Value> {
+    let mut checked = req.clone();
+    checked["public_ip"] = req["ssh_host"].clone();
+    checked["password"] = json!("preflight");
+    checked["name"] = json!("preflight");
+    validate(&checked)?;
+    let address = SocketAddr::new(s(req, "ssh_host").parse()?, n(req, "ssh_port") as u16);
+    let previous = std::fs::read_to_string(pin_path(root, address))
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let inspected = Arc::new(StdMutex::new(String::new()));
+    let handler = HostKey {
+        prior: None,
+        inspected: inspected.clone(),
+    };
+    let result = tokio::time::timeout(
+        Duration::from_secs(15),
+        client::connect(Arc::new(client::Config::default()), address, handler),
+    )
+    .await;
+    let client = result
+        .context("SSH 连接超时")?
+        .context("无法取得 SSH 主机指纹")?;
+    let fingerprint = inspected.lock().unwrap().clone();
+    client
+        .disconnect(russh::Disconnect::ByApplication, "", "en")
+        .await?;
+    Ok(
+        json!({"fingerprint":fingerprint,"previous":previous,"changed":!previous.is_empty() && previous!=fingerprint}),
+    )
+}
+async fn connect(root: &Path, req: &Value) -> Result<(client::Handle<HostKey>, String)> {
+    validate(req)?;
+    let address = SocketAddr::new(s(req, "ssh_host").parse()?, n(req, "ssh_port") as u16);
+    let pin = pin_path(root, address);
+    std::fs::create_dir_all(pin.parent().unwrap())?;
+    let prior = std::fs::read_to_string(&pin)
+        .ok()
+        .map(|s| s.trim().to_owned());
+    let confirmed = s(req, "confirmed_fingerprint");
+    let expected = if confirmed.is_empty() {
+        prior.clone()
+    } else {
+        if !confirmed.starts_with("SHA256:") || confirmed.len() > 100 {
+            bail!("主机指纹格式不正确")
+        }
+        Some(confirmed.to_owned())
+    };
+    let inspected = Arc::new(StdMutex::new(String::new()));
+    let handler = HostKey {
+        prior: expected,
+        inspected: inspected.clone(),
+    };
+    let cfg = client::Config {
+        inactivity_timeout: Some(Duration::from_secs(90)),
+        keepalive_interval: Some(Duration::from_secs(20)),
+        keepalive_max: 3,
+        ..Default::default()
+    };
+    let mut client = tokio::time::timeout(
+        Duration::from_secs(20),
+        client::connect(Arc::new(cfg), address, handler),
+    )
+    .await
+    .context("SSH 连接超时")?
+    .context("SSH 连接或主机指纹校验失败；系统重装后请在连接信息中确认新指纹")?;
+    let success = tokio::time::timeout(
+        Duration::from_secs(15),
+        client.authenticate_password(s(req, "username"), s(req, "password")),
+    )
+    .await
+    .context("SSH 认证超时")?
+    .context("SSH 认证失败")?;
+    if !success.success() {
+        bail!("SSH 用户名或密码不正确")
+    }
+    let fingerprint = inspected.lock().unwrap().clone();
+    if prior.as_deref() != Some(&fingerprint) {
+        atomic_write(&pin, format!("{fingerprint}\n").as_bytes(), 0o600)?;
+    }
+    Ok((client, fingerprint))
+}
+async fn save_connection(store: &Store, req: &Value, fingerprint: &str) -> Result<()> {
+    if s(req, "sealed_password").is_empty() {
+        return Ok(());
+    }
+    let _guard = store.writer.lock().await;
+    let mut tx = store.pool.begin().await?;
+    let old = crate::store::rows(
+        &mut tx,
+        "SELECT value FROM vp_metadata WHERE id=? FOR UPDATE",
+        &[req["node_id"].clone()],
+    )
+    .await?;
+    let mut meta: Value = old
+        .first()
+        .and_then(|v| serde_json::from_str(s(v, "value")).ok())
+        .unwrap_or(json!({}));
+    for k in ["ssh_host", "ssh_port", "username"] {
+        meta[k] = req[k].clone();
+    }
+    for k in ["name", "region", "public_ip"] {
+        if meta[k].is_null() {
+            meta[k] = req[k].clone();
+        }
+    }
+    meta["ssh_secret"] = req["sealed_password"].clone();
+    meta["fingerprint"] = json!(fingerprint);
+    crate::store::exec(
+        &mut tx,
+        "INSERT INTO vp_metadata(id,value) VALUES(?,?) ON DUPLICATE KEY UPDATE value=VALUES(value)",
+        &[req["node_id"].clone(), meta],
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+pub async fn check_connection(root: &Path, req: &Value, store: &Store) -> Result<()> {
+    let (client, fingerprint) = connect(root, req).await?;
+    save_connection(store, req, &fingerprint).await?;
+    client
+        .disconnect(russh::Disconnect::ByApplication, "", "en")
+        .await?;
+    Ok(())
+}
+
+pub async fn occupied_ports(root: &Path, req: &Value) -> Result<Vec<i64>> {
+    let (client, _) = connect(root, req).await?;
+    let output = remote(&client, req, "ss -H -ltnu", b"").await?;
+    client
+        .disconnect(russh::Disconnect::ByApplication, "", "en")
+        .await?;
+    let mut ports = std::collections::BTreeSet::new();
+    for line in output.lines() {
+        if let Some(port) = line
+            .split_whitespace()
+            .nth(4)
+            .and_then(|s| s.rsplit(':').next())
+            .and_then(|p| p.parse::<i64>().ok())
+        {
+            ports.insert(port);
+        }
+    }
+    Ok(ports.into_iter().collect())
 }

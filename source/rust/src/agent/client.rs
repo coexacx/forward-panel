@@ -197,6 +197,8 @@ async fn session(
     .await??;
     let mut errors = Vec::new();
     let mut revision = 0;
+    let mut desired: Option<Config> = None;
+    let mut applied_rules = std::collections::BTreeMap::new();
     let mut decommission =
         std::fs::read_to_string(path.with_extension("removing")).unwrap_or_default();
     if !decommission.is_empty() && !valid_id(&decommission) {
@@ -212,6 +214,9 @@ async fn session(
         r.kernel_version = VERSION.into();
         r.errors = errors.clone();
         r.applied_revision = revision;
+        r.active_rules = Some(e.active_rule_ids().await);
+        r.applied_rules = Some(applied_rules.clone());
+        r.supports_delta = true;
         r.probe = sampler.sample();
         r.probe.target_checks = Some(e.target_checks().await);
         r.decommission_ack = decommission.clone();
@@ -250,9 +255,12 @@ async fn session(
             decommission = cfg.decommission.clone();
             continue;
         }
-        errors = e.apply(&cfg).await;
-        e.journal.prune(&cfg.rules)?;
-        revision = cfg.revision;
+        let full = cfg.expand(desired.as_ref())?;
+        errors = e.apply(&full).await;
+        e.journal.prune(&full.rules)?;
+        applied_rules = full.fingerprints();
+        revision = full.revision;
+        desired = Some(full);
         if let Some(urls) = cfg.controller_urls {
             validate_urls(&urls)?;
             if urls.first() != conf.controller_urls.first() {

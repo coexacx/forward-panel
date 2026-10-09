@@ -53,6 +53,7 @@ type Snapshot = {
   allocations: Any[];
   orders: Any[];
   jobs: Any[];
+  agent_release: Any;
   audit: Any[];
   payment: Any;
   mail: Any;
@@ -104,6 +105,17 @@ const leaseState = (l: Any) =>
             l.used_up + l.used_down >= l.traffic_limit_bytes
           ? "流量用尽"
           : "使用中";
+const forwardingLabel = (a: Any) => ({
+  listening: "节点已监听",
+  accepted: "配置已接收",
+  pending: "正在下发",
+  offline: "节点离线",
+  paused: "已暂停",
+  apply_failed: "监听失败",
+  not_listening: "未监听",
+  unconfigured: "待配置目标",
+} as Any)[a.apply_status] ?? "等待确认";
+const forwardingWarn = (a: Any) => ["apply_failed", "not_listening"].includes(a.apply_status);
 const orderLabel: Any = {
   pending: "待付款",
   paid: "已支付",
@@ -516,6 +528,21 @@ function App() {
       throw Error(out.error ?? "操作未完成");
     }
     return out;
+  }
+  async function connectNode(route: string, request: Any) {
+    setBusy(true); setFormError("");
+    try {
+      const key = await api("admin/inspect-ssh", {
+        ssh_host: request.ssh_host, ssh_port: request.ssh_port, username: request.username,
+      });
+      if (key.changed) {
+        setPopup({kind:"ssh-key-confirm", item:{route,request,key}});
+        return;
+      }
+      await run(route, {...request, confirmed_fingerprint:key.fingerprint},
+        route === "admin/connection" && !request.redeploy ? "连接信息已验证并保存" : "部署任务已启动");
+    } catch (e) {setFormError((e as Error).message);}
+    finally {setBusy(false);}
   }
   async function bootstrap() {
     try {
@@ -1045,7 +1072,7 @@ function App() {
       <>
         {heading(
           "我的转发",
-          "TCP + UDP 共用端口与目标。",
+          "TCP + UDP 共用端口与目标；节点监听与目标连通分别显示。",
           <Button primary onClick={() => open("claim")}>
             <Plus size={16} />
             添加转发
@@ -1068,10 +1095,7 @@ function App() {
               )
               .map((a) => {
                 const l = myLeases.find((l) => l.id === a.lease_id)!,
-                  n = nodes.find((n) => n.id === a.node_id),
-                  issue = (n?.errors ?? []).find(
-                    (e: Any) => e.rule_id === a.id,
-                  );
+                  n = nodes.find((n) => n.id === a.node_id);
                 return (
                   <tr key={a.id}>
                     <td>
@@ -1090,19 +1114,8 @@ function App() {
                     </td>
                     <td>{l.plan_name}</td>
                     <td>
-                      <Tag
-                        good={leaseState(l) === "使用中" && n?.online && !issue}
-                        warn={!!issue}
-                      >
-                        {issue
-                          ? "下发失败"
-                          : leaseState(l) !== "使用中"
-                            ? leaseState(l)
-                            : !n?.online
-                              ? "等待节点"
-                              : n?.syncing
-                                ? "正在下发"
-                                : "已下发"}
+                      <Tag good={a.apply_status === "listening"} warn={forwardingWarn(a)}>
+                        {leaseState(l) !== "使用中" ? leaseState(l) : forwardingLabel(a)}
                       </Tag>
                     </td>
                     <td>
@@ -1227,6 +1240,7 @@ function App() {
                   {admin ? (
                     <>
                       <Button onClick={() => open("lease", l)}>管理套餐</Button>
+                      <Button danger onClick={() => open("delete-lease", l)}>删除套餐</Button>
                     </>
                   ) : (
                     !l.ended && (
@@ -1247,6 +1261,9 @@ function App() {
                         </Button>
                       </>
                     )
+                  )}
+                  {!admin && (l.ended || l.expires_at <= Date.now() / 1000) && (
+                    <Button danger onClick={() => open("delete-lease", l)}>删除套餐</Button>
                   )}
                 </div>
               </Box>
@@ -1313,7 +1330,10 @@ function App() {
                   {p.node_ids.map(nodeName).join(" · ")}
                 </p>
                 {admin ? (
-                  <Button onClick={() => open("plan", p)}>编辑套餐</Button>
+                  <div className="card-actions">
+                    <Button onClick={() => open("plan", p)}>编辑套餐</Button>
+                    <Button danger onClick={() => open("delete-plan", p)}>删除套餐</Button>
+                  </div>
                 ) : (
                   <Button
                     primary
@@ -1524,6 +1544,15 @@ function App() {
             添加服务器
           </Button>,
         )}
+        <div className="toolbar">
+          <span className="hint">
+            {data.agent_release?.checking ? "正在检查 Agent 版本…" :
+              data.agent_release?.status === "ok" ? "最新稳定版 " + data.agent_release.version :
+              "版本检查暂不可用"}
+          </span>
+          <Button disabled={busy || data.agent_release?.checking}
+            onClick={() => act("admin/check-agent-release", {}, "已提交版本检查")}>检查更新</Button>
+        </div>
         {data.jobs.length > 0 && (
           <Box title="部署任务">
             <div className="job-list">
@@ -1550,11 +1579,9 @@ function App() {
                       <button
                         className="text-button"
                         onClick={() =>
-                          open("node", {
-                            id: j.node_id,
-                            name: j.name,
-                            ...(nodes.find((n) => n.id === j.node_id) ?? {}),
-                          })
+                          nodes.some((n)=>n.id===j.node_id)
+                            ? open("connection", nodes.find((n)=>n.id===j.node_id))
+                            : open("node", {name:j.name})
                         }
                       >
                         重试
@@ -1650,11 +1677,13 @@ function App() {
                       >
                         编辑
                       </button>
-                      <button
-                        onClick={() => open("node", n)}
-                        disabled={!!n.removal_status}
-                      >
-                        部署 / 更新
+                      <button onClick={() => open("connection", n)} disabled={!!n.removal_status}>
+                        连接信息
+                      </button>
+                      <button onClick={() => act("admin/update-agent", {node_id:n.id}, "更新任务已启动")}
+                        disabled={busy || !!n.removal_status || !n.update_available || !n.meta?.has_ssh_password}
+                        title={!n.meta?.has_ssh_password ? "请先保存 SSH 连接信息" : n.update_available ? "更新至 " + data.agent_release.version : "尚未检测到新版本"}>
+                        更新
                       </button>
                       <button
                         className="danger-text"
@@ -1722,18 +1751,8 @@ function App() {
                       {a.remark && <small>{a.remark}</small>}
                     </td>
                     <td>
-                      <Tag good={leaseState(l) === "使用中" && n?.online}>
-                        {leaseState(l) !== "使用中"
-                          ? leaseState(l)
-                          : !n?.online
-                            ? "节点离线"
-                            : n.syncing
-                              ? "正在下发"
-                              : a.target_checks?.some(
-                                    (t: Any) => t.status === "apply_failed",
-                                  )
-                                ? "下发失败"
-                                : "已下发"}
+                      <Tag good={a.apply_status === "listening"} warn={forwardingWarn(a)}>
+                        {leaseState(l) !== "使用中" ? leaseState(l) : forwardingLabel(a)}
                       </Tag>
                     </td>
                     <td>
@@ -2235,79 +2254,46 @@ function App() {
         "验证并关闭",
       );
 
-    if (popup.kind === "node")
-      return form(
-        item.id ? "重新部署节点" : "添加转发服务器",
-        <>
-          <p className="hint">
-            支持 Debian 和 Ubuntu。SSH 密码仅用于本次连接，不会存入数据库。
-          </p>
-          <div className="form-grid">
-            <Field
-              label="节点名称"
-              name="name"
-              defaultValue={item.name}
-              maxLength={40}
-              required
-            />
-            <Field
-              label="所在地区"
-              name="region"
-              defaultValue={item.meta?.region}
-              maxLength={40}
-              required
-            />
-            <Field
-              label="SSH 连接 IP"
-              name="ssh_host"
-              defaultValue={item.meta?.ssh_host}
-              required
-            />
-            <Field
-              label="SSH 端口"
-              name="ssh_port"
-              type="number"
-              min="1"
-              max="65535"
-              defaultValue={item.meta?.ssh_port ?? 22}
-              required
-            />
-            <Field
-              label="SSH 用户名"
-              name="username"
-              defaultValue={item.meta?.username ?? "root"}
-              required
-            />
-            <Field
-              label="SSH 密码"
-              name="password"
-              type="password"
-              autoComplete="off"
-              required
-            />
-          </div>
-          <Field
-            label="对外显示连接 IP"
-            name="public_ip"
-            defaultValue={item.meta?.public_ip}
-            required
-          />
-          <p className="hint">
-            主控自动检查系统状态、下载并验证程序、部署服务，再确认 WSS
-            上报。已有节点重新部署会保留其身份。
-          </p>
-        </>,
-        submit(
-          "admin/deploy",
-          (v) => ({
-            ...v,
-            ssh_port: Number(v.ssh_port),
-            node_id: item.id ?? "",
-          }),
-          "部署任务已启动，可在节点页面查看进度",
-        ),
-        "连接并部署",
-      );
+    if (popup.kind === "ssh-key-confirm")
+      return form("确认 SSH 主机变更", <>
+        <p>此服务器的 SSH 主机指纹已改变。如果刚重装系统，请核对新指纹后继续。</p>
+        <dl className="details">
+          <div><dt>原指纹</dt><dd className="mono" style={{overflowWrap:"anywhere"}}>{item.key.previous}</dd></div>
+          <div><dt>新指纹</dt><dd className="mono" style={{overflowWrap:"anywhere"}}>{item.key.fingerprint}</dd></div>
+        </dl>
+        <p className="hint">确认只对当前显示的指纹有效；连接过程中再次变化会停止认证。</p>
+      </>, submit(item.route, () => ({...item.request, confirmed_fingerprint:item.key.fingerprint}),
+        "连接已验证，操作已提交"), "确认重装并继续");
+    if (popup.kind === "node" || popup.kind === "connection") {
+      const connection = popup.kind === "connection";
+      return form(connection ? "连接信息" : "添加转发服务器", <>
+        <p className="hint">支持 Debian 和 Ubuntu。SSH 密码加密保存，用于后续部署与更新。</p>
+        <div className="form-grid">
+          {!connection && <>
+            <Field label="节点名称" name="name" defaultValue={item.name} maxLength={40} required />
+            <Field label="所在地区" name="region" maxLength={40} required />
+          </>}
+          <Field label="SSH 连接 IP" name="ssh_host" defaultValue={item.meta?.ssh_host} required />
+          <Field label="SSH 端口" name="ssh_port" type="number" min="1" max="65535"
+            defaultValue={item.meta?.ssh_port ?? 22} required />
+          <Field label="SSH 用户名" name="username" defaultValue={item.meta?.username ?? "root"} required />
+          <Field label="SSH 密码" name="password" type="password" autoComplete="new-password"
+            required={!connection || !item.meta?.has_ssh_password}
+            hint={connection && item.meta?.has_ssh_password ? "已加密保存；留空保留。更改地址或用户名时需重新填写。" : undefined} />
+        </div>
+        {!connection && <Field label="对外显示连接 IP" name="public_ip" required />}
+        {connection && <label className="check-line">
+          <input type="checkbox" name="redeploy" /><span>系统已重装，保存后重新部署 Agent</span>
+        </label>}
+      </>, (e) => {
+        const form = e.currentTarget;
+        const v = formdata(e);
+        connectNode(connection ? "admin/connection" : "admin/deploy", {
+          ...v, ssh_port:Number(v.ssh_port), node_id:connection ? item.id : "",
+          redeploy:new FormData(form).has("redeploy"),
+        });
+      }, connection ? "验证并保存" : "连接并部署");
+    }
     if (popup.kind === "node-detail" || popup.kind === "probe") {
       const n = nodes.find((n) => n.id === item.id) ?? item;
       return (
@@ -2365,7 +2351,10 @@ function App() {
             {admin && (
               <div className="card-actions">
                 <Button onClick={() => open("node-edit", n)}>编辑资料</Button>
-                <Button onClick={() => open("node", n)}>部署 / 更新</Button>
+                <Button onClick={() => open("connection", n)}>连接信息</Button>
+                <Button disabled={!n.update_available || !n.meta?.has_ssh_password || busy}
+                  onClick={() => act("admin/update-agent", {node_id:n.id}, "更新任务已启动")}>更新</Button>
+                <Button onClick={() => open("rule-migration", n)}>规则导入 / 导出</Button>
                 <Button danger onClick={() => open("remove-node", n)}>
                   删除服务器
                 </Button>
@@ -2375,6 +2364,65 @@ function App() {
         </Modal>
       );
     }
+    if (popup.kind === "rule-migration")
+      return <Modal title={item.name + " · 规则导入 / 导出"} onClose={() => setPopup(null)} busy={busy}>
+        <div className="modal-body">
+          <p>导出当前服务器的转发规则，或将规则文件恢复到这台服务器。</p>
+          <Button disabled={busy} onClick={async () => {
+            setBusy(true); setFormError("");
+            try {
+              const result = await api("admin/export-rules", {node_id:item.id});
+              const url = URL.createObjectURL(new Blob([JSON.stringify(result.file)],{type:"application/json"}));
+              const a=document.createElement("a"); a.href=url;
+              a.download="forward-rules-"+item.id.slice(0,8)+".json"; a.click();
+              setTimeout(()=>URL.revokeObjectURL(url),1000);
+              notice("规则文件已导出");
+            } catch(e) {setFormError((e as Error).message);} finally {setBusy(false);}
+          }}>导出规则</Button>
+          <label className="field"><span>导入规则文件</span>
+            <input type="file" accept=".json,application/json" disabled={busy || !item.online}
+              onChange={async (e) => {
+                const file=e.currentTarget.files?.[0]; if(!file)return;
+                setBusy(true);setFormError("");
+                try {
+                  if(file.size>4*1024*1024)throw Error("规则文件过大");
+                  const data=JSON.parse(await file.text());
+                  const result=await api("admin/preview-rules",{node_id:item.id,file:data});
+                  setPopup({kind:"rule-preview",item:{node:item,file:data,...result}});
+                } catch(e) {setFormError((e as Error).message);} finally {setBusy(false);}
+              }} />
+          </label>
+          <p className="hint">导入前先检查端口，不会立即变更规则。支持当前面板内迁移和同一服务器重装恢复。请先完成目标服务器部署并保存 SSH 连接信息。</p>
+          {feedback}
+        </div>
+      </Modal>;
+    if (popup.kind === "rule-preview")
+      return form(item.preview.source_id === item.preview.node_id ? "确认恢复规则" : "确认迁移规则", <>
+        <p>{item.preview.entries.length} 条规则将恢复到「{item.node.name}」。用户归属、转发目标、备注、已用流量、暂停状态和到期时间保留。</p>
+        <p className="hint">同步 {item.preview.leases.length} 个用户套餐与 {item.preview.plans.length} 个套餐商品的节点绑定。跨服务器迁移会关闭旧入口，用户页面自动显示新入口。</p>
+        <div className="table-wrap"><table><thead><tr><th>原入口</th><th>新入口</th><th>目标</th></tr></thead><tbody>
+          {item.preview.entries.map((r:Any)=><tr key={r.old_id}>
+            <td className="mono">{endpoint(r.old_ip,r.old_port)}</td>
+            <td className="mono">{endpoint(r.public_ip,r.port)}{r.old_port!==r.port && <small>原端口不可用，已选择池内空闲端口</small>}</td>
+            <td className="mono">{r.target_host ? endpoint(r.target_host,r.target_port) : "待配置"}</td>
+          </tr>)}
+        </tbody></table></div>
+        <p className="hint">预览有效期 5 分钟。端口占用或原规则发生变化时，会要求重新预览。</p>
+      </>, async(e)=>{
+        e.preventDefault();
+        try {
+          const result=await run("admin/import-rules",{node_id:item.node.id,file:item.file,preview_token:item.preview_token},
+            "规则已恢复，正在等待节点确认监听");
+          setPopup({kind:"rule-result",item:result});
+        }catch{}
+      }, "确认导入");
+    if (popup.kind === "rule-result")
+      return <Modal title="规则已导入" onClose={()=>setPopup(null)}>
+        <div className="modal-body">
+          <p>已处理 {item.entries.length} 条规则。请在“全部转发”查看节点监听与目标连通状态。</p>
+          <Button primary onClick={()=>go("/admin/forwards")}>查看转发状态</Button>
+        </div>
+      </Modal>;
     if (popup.kind === "remove-node")
       return form(
         "删除转发服务器",
@@ -2444,6 +2492,10 @@ function App() {
             defaultValue={item.meta?.region}
             required
           />
+          <Field label="对外显示连接 IP" name="public_ip"
+            defaultValue={item.meta?.public_ip} required
+            hint="保存后同步端口池与现有转发的连接地址；可填写互联或 NAT 入口 IP。"
+          />
           <label className="check-line">
             <input
               type="checkbox"
@@ -2469,6 +2521,17 @@ function App() {
           onSubmit={(v) => run("admin/pool", v, "端口池已添加").catch(() => {})}
         />
       );
+    if (popup.kind === "delete-plan")
+      return form("删除套餐商品", <>
+        <p>删除「{item.name}」后不再出售，已购买用户的套餐与转发继续保留。</p>
+        <Field label="输入套餐名称确认" name="confirm_name" required autoComplete="off" />
+      </>, submit("admin/delete-plan", (v) => ({ ...v, id: item.id }), "套餐已删除"), "删除套餐");
+    if (popup.kind === "delete-lease")
+      return form("删除用户套餐", <>
+        <p>删除「{item.plan_name}」并释放其全部端口，关联转发将停止。历史订单与已结算流量保留。</p>
+        {admin && <Field label="输入套餐名称确认" name="confirm_name" required autoComplete="off" />}
+      </>, submit(admin ? "admin/delete-lease" : "delete-lease",
+        (v) => ({ ...v, id: item.id }), "套餐已删除，端口已释放"), "确认删除");
     if (popup.kind === "plan")
       return form(
         item.id ? "编辑套餐" : "添加套餐",
@@ -2556,8 +2619,14 @@ function App() {
             />
             <span>上架此套餐</span>
           </label>
+          {item.id && <label className="check-line">
+            <input type="checkbox" name="update_existing" />
+            <span>强制更新已有用户套餐</span>
+          </label>}
           <p className="hint">
-            调整套餐配置仅影响后续新开通的套餐，已有套餐保留原资源额度。
+            默认保留已有套餐额度。勾选后同步名称、端口、流量、节点和后续周期，
+            保留到期时间、下次重置日与已用流量。
+            移除节点及超出新额度的转发会被释放，优先保留较小端口。
           </p>
         </>,
         submit("admin/plan", (v, f) => ({
@@ -2570,6 +2639,7 @@ function App() {
           traffic_limit_bytes: Math.round(Number(v.traffic) * 1e9),
           node_ids: new FormData(f).getAll("node_ids"),
           enabled: new FormData(f).has("enabled"),
+          update_existing: new FormData(f).has("update_existing"),
         })),
       );
     if (popup.kind === "claim")

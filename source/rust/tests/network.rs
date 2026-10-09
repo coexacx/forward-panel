@@ -79,6 +79,7 @@ async fn real_tcp_udp_half_close_live_cycle_and_shutdown() {
         ..Default::default()
     };
     assert!(e.apply(&config).await.is_empty());
+    assert_eq!(e.active_rule_ids().await, vec!["rule"]);
     let mut c = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     let sent = vec![0x5a; 2 * 1024 * 1024];
     let (mut r, mut w) = c.split();
@@ -141,6 +142,7 @@ async fn real_tcp_udp_half_close_live_cycle_and_shutdown() {
     assert_eq!(j.meter("rule", "cycle2").counter().up, 3);
     assert_eq!(j.meter("rule", "cycle1").counter().up, total);
     e.suspend().await;
+    assert!(e.active_rule_ids().await.is_empty());
     assert!(TcpStream::connect(("127.0.0.1", port)).await.is_err());
     let closed = tokio::time::timeout(Duration::from_secs(2), persistent.read(&mut buf))
         .await
@@ -195,6 +197,131 @@ async fn tcp_udp_bind_is_atomic_and_capacity_is_bounded() {
         .await
         .unwrap();
     assert!(result.is_err() || result.unwrap() == 0);
+    e.close().await;
+    drop(e);
+    drop(j);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn incremental_changes_preserve_unrelated_live_connections() {
+    let dir = std::env::temp_dir().join(format!("forward-delta-{}", id()));
+    std::fs::create_dir(&dir).unwrap();
+    let j = Journal::open(&dir.join("traffic.json")).unwrap();
+    let e = Engine::new(
+        j.clone(),
+        Arc::new(Resolver::new(vec!["127.0.0.0/8".parse().unwrap()], vec![])),
+        8,
+        8,
+    );
+    let target = echo().await;
+    let target2 = echo().await;
+    let spare = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = spare.local_addr().unwrap().port();
+    drop(spare);
+    let a = Rule {
+        id: "unchanged".into(),
+        cycle_id: "cycle".into(),
+        listen_ip: "127.0.0.1".into(),
+        listen_port: port,
+        target_host: "127.0.0.1".into(),
+        target_port: target,
+        expires_at: now() + 300,
+        ..Default::default()
+    };
+    let mut baseline = Config {
+        version: 1,
+        revision: 1,
+        valid_for_seconds: 30,
+        rules: vec![a.clone()],
+        ..Default::default()
+    };
+    let mut desired = baseline.expand(None).unwrap();
+    assert!(e.apply(&desired).await.is_empty());
+    let mut live = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    async fn check(c: &mut TcpStream) {
+        c.write_all(b"still here").await.unwrap();
+        let mut b = [0; 10];
+        tokio::time::timeout(Duration::from_secs(2), c.read_exact(&mut b))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&b, b"still here");
+    }
+    check(&mut live).await;
+    let blocker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let other_port = blocker.local_addr().unwrap().port();
+    let mut added = a.clone();
+    added.id = "added".into();
+    added.listen_port = other_port;
+    baseline.revision = 2;
+    baseline.rules.push(added.clone());
+    let wire = baseline.delta_from(&desired);
+    assert!(wire.delta);
+    assert_eq!(wire.rules, vec![added.clone()]);
+    assert!(wire.removed_rules.is_empty());
+    assert!(wire.expand(None).is_err(), "reconnect requires full sync");
+    desired = wire.expand(Some(&desired)).unwrap();
+    assert_eq!(e.apply(&desired).await[0].rule_id, "added");
+    assert_eq!(e.active_rule_ids().await, vec!["unchanged"]);
+    check(&mut live).await;
+    drop(blocker);
+    let heartbeat = baseline.delta_from(&desired);
+    assert!(heartbeat.rules.is_empty() && heartbeat.removed_rules.is_empty());
+    desired = heartbeat.expand(Some(&desired)).unwrap();
+    assert!(
+        e.apply(&desired).await.is_empty(),
+        "retry failed bind without replaying other rules"
+    );
+    check(&mut live).await;
+    let mut second = TcpStream::connect(("127.0.0.1", other_port)).await.unwrap();
+    check(&mut second).await;
+    baseline.revision = 3;
+    baseline.rules[1].target_port = target2;
+    let wire = baseline.delta_from(&desired);
+    assert_eq!(wire.rules.len(), 1);
+    assert_eq!(wire.rules[0].id, "added");
+    desired = wire.expand(Some(&desired)).unwrap();
+    assert!(e.apply(&desired).await.is_empty());
+    check(&mut live).await;
+    baseline.revision = 4;
+    baseline.rules.retain(|r| r.id == "unchanged");
+    let wire = baseline.delta_from(&desired);
+    assert!(wire.rules.is_empty());
+    assert_eq!(wire.removed_rules, vec!["added"]);
+    desired = wire.expand(Some(&desired)).unwrap();
+    assert!(e.apply(&desired).await.is_empty());
+    check(&mut live).await;
+    assert_eq!(e.active_rule_ids().await, vec!["unchanged"]);
+    assert!(TcpStream::connect(("127.0.0.1", other_port)).await.is_err());
+    assert!(
+        wire.expand(Some(&desired)).is_err(),
+        "stale patch is rejected"
+    );
+    assert_eq!(desired.fingerprints()["unchanged"], a.fingerprint());
+    let mut conflict = baseline.delta_from(&desired);
+    conflict.rules = vec![a.clone()];
+    conflict.removed_rules = vec![a.id.clone()];
+    assert!(conflict.expand(Some(&desired)).is_err());
+    let mut too_many = baseline.clone();
+    too_many.rules = (0..513)
+        .map(|i| {
+            let mut r = a.clone();
+            r.id = format!("r{i}");
+            r
+        })
+        .collect();
+    assert!(too_many.expand(None).is_err());
+    let legacy: vistart_forward::protocol::Report =
+        serde_json::from_str(r#"{"version":1,"applied_revision":1}"#).unwrap();
+    assert!(!legacy.supports_delta && legacy.applied_rules.is_none());
+    let legacy_cfg: Config =
+        serde_json::from_str(r#"{"version":1,"revision":5,"valid_for_seconds":10,"rules":[]}"#)
+            .unwrap();
+    assert!(!legacy_cfg.delta);
+    desired = legacy_cfg.expand(Some(&desired)).unwrap();
+    assert!(e.apply(&desired).await.is_empty());
+    assert!(e.active_rule_ids().await.is_empty());
     e.close().await;
     drop(e);
     drop(j);

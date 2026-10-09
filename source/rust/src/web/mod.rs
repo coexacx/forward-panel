@@ -192,7 +192,7 @@ fn error(e: anyhow::Error) -> Response {
             "package quota exhausted" => "套餐已到期、暂停或额度不足",
             "invalid payment data" => "支付配置或所选付款方式不可用",
             "upgrade agent before removal" => "请先更新在线节点的 Agent，再执行删除",
-            _ => "操作未完成",
+            _ => e.message,
         };
         (e.code, message.into())
     } else if e
@@ -240,9 +240,30 @@ async fn api(
             .and_then(|v| v.to_str().ok())
             == Some("https");
     let result = async {
+        let large_import = ["admin/preview-rules", "admin/import-rules"].contains(&route.as_str());
+        let limit = if large_import {
+            let early = Session::load(&app, &headers).await?;
+            if early.user.as_ref().is_none_or(|u| s(u, "role") != "admin") {
+                return Err(fail(403, "需要管理员权限"));
+            }
+            if !bool::from(
+                early.csrf.as_bytes().ct_eq(
+                    headers
+                        .get("x-csrf-token")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .as_bytes(),
+                ),
+            ) {
+                return Err(fail(419, "页面已过期，请刷新重试"));
+            }
+            8 << 20
+        } else {
+            65536
+        };
         let body = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            axum::body::to_bytes(body, 65536),
+            axum::body::to_bytes(body, limit),
         )
         .await
         .map_err(|_| fail(408, "请求超时"))?
@@ -252,7 +273,7 @@ async fn api(
             return Err(fail(421, "请使用配置的面板地址"));
         }
         drop(config);
-        if body.len() > 65536 {
+        if body.len() > limit {
             return Err(fail(413, "请求过大"));
         }
         let session = Session::load(&app, &headers).await?;
@@ -372,6 +393,16 @@ async fn dispatch(
             let out=crate::control::dispatch(ctx.app,json!({"action":"checkout","user_id":user["id"],"id":ident(v,"id")?,"method":text(v,"method",80,false)?})).await?;
             ctx.audit("发起支付", s(&user, "id"), s(v, "id")).await?;
             return Ok(out);
+        }
+        "delete-lease" => {
+            let id = ident(v, "id")?;
+            let result = ctx
+                .app
+                .store
+                .command(json!({"action":"delete-lease","id":id,"user_id":user["id"]}))
+                .await?;
+            ctx.audit("删除已结束套餐", s(&user, "id"), &id).await?;
+            return Ok(result);
         }
         "cancel-order" | "release" => {
             let id = ident(v, "id")?;

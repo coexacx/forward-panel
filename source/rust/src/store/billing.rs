@@ -24,7 +24,7 @@ pub(super) async fn grant(db: &mut MySqlConnection, user: &str, p: &Value) -> Re
     let at = now() + n(&p, "period_days") * 86400;
     exec(
         db,
-        "INSERT INTO vp_leases VALUES(?,?,?,?,?,?,?,?,?,?,?,0,0)",
+        "INSERT INTO vp_leases(id,user_id,plan_id,plan_name,port_limit,traffic_limit,period_days,node_ids,expires_at,next_reset_at,current_cycle,manual_paused,ended) VALUES(?,?,?,?,?,?,?,?,?,?,?,0,0)",
         &[
             json!(lid),
             json!(user),
@@ -74,7 +74,7 @@ pub(super) async fn tick(db: &mut MySqlConnection) -> Result<()> {
     let due = rows(
         db,
         &format!(
-            "{LEASE} WHERE l.ended=0 AND l.next_reset_at<=? AND l.next_reset_at<=l.expires_at"
+            "{LEASE} WHERE l.deleted=0 AND l.ended=0 AND l.next_reset_at<=? AND l.next_reset_at<=l.expires_at"
         ),
         &[json!(now())],
     )
@@ -131,7 +131,7 @@ pub(super) async fn new_order(db: &mut MySqlConnection, c: &Value) -> Result<Val
         .into());
     }
     let p = plan(db, pid).await?;
-    if !b(&p, "enabled") {
+    if !b(&p, "enabled") || b(&p, "deleted") {
         return Err(forbidden());
     }
     let mut lid = s(c, "lease_id").to_owned();
@@ -196,7 +196,11 @@ async fn settle(db: &mut MySqlConnection, mut o: Value) -> Result<Value> {
         }
     }
     o["status"] = json!("paid");
-    if s(&o, "kind") == "new" {
+    let current_plan = plan(db, s(&o, "plan_id")).await?;
+    if b(&current_plan, "deleted") {
+        // A valid delayed payment still needs a durable receipt, never a revived package.
+        o["status"] = json!("paid_review");
+    } else if s(&o, "kind") == "new" {
         match grant(db, s(&o, "user_id"), &o["snapshot"]).await {
             Ok(l) => o["lease_id"] = l["id"].clone(),
             Err(e)

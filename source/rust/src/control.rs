@@ -96,6 +96,38 @@ pub async fn dispatch(a: &App, c: Value) -> Result<Value> {
             if s(&o, "user_id") != s(&c, "user_id") || s(&o, "status") != "pending" {
                 return Err(crate::store::forbidden());
             }
+            {
+                let mut db = a.store.pool.acquire().await?;
+                if crate::store::count(
+                    &mut db,
+                    "SELECT COUNT(*) n FROM vp_plans WHERE id=? AND deleted=0",
+                    &[o["plan_id"].clone()],
+                )
+                .await?
+                    != 1
+                {
+                    return Err(crate::store::Fault {
+                        code: 409,
+                        message: "套餐已删除，无法继续支付",
+                    }
+                    .into());
+                }
+                if !s(&o, "lease_id").is_empty()
+                    && crate::store::count(
+                        &mut db,
+                        "SELECT COUNT(*) n FROM vp_leases WHERE id=? AND deleted=0",
+                        &[o["lease_id"].clone()],
+                    )
+                    .await?
+                        != 1
+                {
+                    return Err(crate::store::Fault {
+                        code: 409,
+                        message: "用户套餐已删除，无法继续支付",
+                    }
+                    .into());
+                }
+            }
             if n(&o, "amount_cents") == 0 {
                 a.store
                     .payment("free", &format!("free_{}", s(&o, "id")), s(&o, "id"), 0)
@@ -221,6 +253,7 @@ async fn agent(
 }
 async fn session(a: &App, id: &str, token: &str, mut ws: WebSocket) -> Result<()> {
     let mut next = tokio::time::Instant::now();
+    let mut previous: Option<Config> = None;
     loop {
         tokio::time::sleep_until(next).await;
         next = tokio::time::Instant::now() + Duration::from_millis(500);
@@ -245,11 +278,21 @@ async fn session(a: &App, id: &str, token: &str, mut ws: WebSocket) -> Result<()
         cfg.ack_epoch = r.epoch;
         cfg.ack_sequence = r.sequence;
         let finish = !cfg.decommission.is_empty() && r.decommission_ack == cfg.decommission;
+        let wire = if r.supports_delta
+            && cfg.decommission.is_empty()
+            && let Some(old) = &previous
+            && old.revision == r.applied_revision
+        {
+            cfg.delta_from(old)
+        } else {
+            cfg.clone()
+        };
         tokio::time::timeout(
             Duration::from_secs(5),
-            ws.send(Message::Text(serde_json::to_string(&cfg)?.into())),
+            ws.send(Message::Text(serde_json::to_string(&wire)?.into())),
         )
         .await??;
+        previous = Some(cfg.clone());
         if finish {
             a.store.finish_removal(id, &cfg.decommission).await?;
             return Ok(());

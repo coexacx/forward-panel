@@ -4,6 +4,66 @@ use auth::{check_password, make_password, password, second_factor};
 pub async fn dispatch(ctx: &mut Context<'_>, route: &str, v: &Value) -> Result<Value> {
     let user = ctx.admin()?.clone();
     match route {
+        "admin/export-rules" => {
+            let nid = ident(v, "node_id")?;
+            let payload = ctx
+                .app
+                .store
+                .command(json!({"action":"export-node-rules","actor_id":user["id"],"node_id":nid}))
+                .await?;
+            let signature = sign_rules(ctx.app, &payload)?;
+            ctx.audit("导出转发规则", "", &nid).await?;
+            Ok(json!({"file":{"payload":payload,"signature":signature}}))
+        }
+        "admin/preview-rules" | "admin/import-rules" => {
+            rate(ctx.app, &format!("rule-import:{}", s(&user, "id")), 10, 60).await?;
+            let nid = ident(v, "node_id")?;
+            let file = &v["file"]["payload"];
+            verify_rules(ctx.app, file, s(&v["file"], "signature"))?;
+            if s(file, "format") != "vistart-forward-rules" || n(file, "schema") != 1 {
+                return Err(fail(400, "不支持的规则文件"));
+            }
+            use sha2::{Digest, Sha256};
+            let file_hash = hex::encode(Sha256::digest(serde_json::to_vec(file)?));
+            let request = migration_ssh(ctx.app, &nid).await?;
+            let occupied = crate::deploy::occupied_ports(&ctx.app.root, &request)
+                .await
+                .map_err(|e| fail(400, format!("目标服务器检查失败：{e}")))?;
+            let mut command = json!({"action":"preview-node-migration","actor_id":user["id"],"node_id":nid,
+                "file":file,"file_hash":file_hash,"occupied_ports":occupied});
+            if route == "admin/preview-rules" {
+                let preview = ctx.app.store.command(command).await?;
+                let token = auth::seal(
+                    ctx.app,
+                    &json!({"purpose":"rule-migration","actor_id":user["id"],
+                    "file_hash":file_hash,"preview":preview,"expires":now()+300})
+                    .to_string(),
+                )?;
+                Ok(json!({"preview":preview,"preview_token":token}))
+            } else {
+                let raw = text(v, "preview_token", 900_000, true)?;
+                let approved: Value = serde_json::from_str(&auth::unseal(ctx.app, &raw)?)?;
+                if s(&approved, "purpose") != "rule-migration"
+                    || approved["actor_id"] != user["id"]
+                    || s(&approved, "file_hash") != file_hash
+                    || s(&approved["preview"], "node_id") != nid
+                    || n(&approved, "expires") < now()
+                {
+                    return Err(fail(409, "预览已失效，请重新检查后确认"));
+                }
+                command["action"] = json!("import-node-rules");
+                command["preview"] = approved["preview"].clone();
+                let result = ctx.app.store.command(command).await?;
+                ctx.audit(
+                    "导入转发规则",
+                    "",
+                    &format!("{} → {nid}", s(&file["source_node"], "id")),
+                )
+                .await?;
+                Ok(result)
+            }
+        }
+
         "admin/order-status" => {
             let id = ident(v, "id")?;
             let status = text(v, "status", 20, true)?;
@@ -24,46 +84,140 @@ pub async fn dispatch(ctx: &mut Context<'_>, route: &str, v: &Value) -> Result<V
             .await?;
             Ok(json!({"ok":true,"order":o}))
         }
-        "admin/deploy" => {
-            let id = if s(v, "node_id").is_empty() {
-                id()
-            } else {
-                ident(v, "node_id")?
-            };
-            if s(v, "password").len() > 512 {
-                return Err(fail(400, "SSH 密码格式不正确"));
+        "admin/inspect-ssh" => {
+            rate(ctx.app, &format!("ssh-inspect:{}", s(&user, "id")), 12, 60).await?;
+            let req = json!({"ssh_host":text(v,"ssh_host",64,true)?,
+                "ssh_port":integer(v,"ssh_port",1,65535)?,"username":text(v,"username",32,true)?});
+            crate::deploy::inspect_host(&ctx.app.root, &req)
+                .await
+                .map_err(|e| fail(400, e.to_string()))
+        }
+        "admin/check-agent-release" => Ok(ctx.app.jobs.release_status(true).await),
+        "admin/connection" | "admin/deploy" | "admin/update-agent" => {
+            rate(ctx.app, &format!("ssh-operation:{}", s(&user, "id")), 8, 60).await?;
+            let existing = !s(v, "node_id").is_empty();
+            if route != "admin/deploy" && !existing {
+                return Err(fail(400, "请选择转发服务器"));
             }
-            let request = json!({"node_id":id,"name":text(v,"name",40,true)?,"region":text(v,"region",40,true)?,"ssh_host":text(v,"ssh_host",64,true)?,"ssh_port":integer(v,"ssh_port",1,65535)?,"username":text(v,"username",32,true)?,"password":s(v,"password"),"public_ip":text(v,"public_ip",64,true)?});
+            let nid = if existing { ident(v, "node_id")? } else { id() };
+            let meta = metadata(ctx.app, &nid).await?;
+            let node = if existing {
+                let mut db = ctx.app.store.pool.acquire().await?;
+                let n = one(
+                    &mut db,
+                    "SELECT name,enabled,agent_version FROM vp_nodes WHERE id=? AND deleted=0",
+                    &[json!(nid)],
+                )
+                .await?;
+                if count(
+                    &mut db,
+                    "SELECT COUNT(*) n FROM vp_node_removals WHERE node_id=?",
+                    &[json!(nid)],
+                )
+                .await?
+                    > 0
+                {
+                    return Err(fail(409, "服务器正在移除"));
+                }
+                n
+            } else {
+                json!({})
+            };
+            let updating = route == "admin/update-agent";
+            let input = if updating { &meta } else { v };
+            let host = text(input, "ssh_host", 64, true)?;
+            let port = integer(input, "ssh_port", 1, 65535)?;
+            let username = text(input, "username", 32, true)?;
+            let password = if !updating && !s(v, "password").is_empty() {
+                s(v, "password").to_owned()
+            } else {
+                if s(&meta, "ssh_secret").is_empty() {
+                    return Err(fail(400, "请先在连接信息中保存 SSH 密码"));
+                }
+                let secret: Value =
+                    serde_json::from_str(&auth::unseal(ctx.app, s(&meta, "ssh_secret"))?)?;
+                if s(&secret, "node_id") != nid
+                    || s(&secret, "ssh_host") != host
+                    || n(&secret, "ssh_port") != port
+                    || s(&secret, "username") != username
+                {
+                    return Err(fail(400, "连接地址或用户名已改变，请重新填写 SSH 密码"));
+                }
+                s(&secret, "password").to_owned()
+            };
+            let name = if existing {
+                s(&node, "name").to_owned()
+            } else {
+                text(v, "name", 40, true)?
+            };
+            let region = if existing {
+                text(&meta, "region", 40, true)?
+            } else {
+                text(v, "region", 40, true)?
+            };
+            let public_ip = if existing {
+                text(&meta, "public_ip", 64, true)?
+            } else {
+                text(v, "public_ip", 64, true)?
+            };
+            let secret = json!({"node_id":nid,"ssh_host":host,"ssh_port":port,"username":username,"password":password});
+            let mut request = secret.clone();
+            request["name"] = json!(name);
+            request["region"] = json!(region);
+            request["public_ip"] = json!(public_ip);
+            request["sealed_password"] = json!(auth::seal(ctx.app, &secret.to_string())?);
+            if !updating {
+                request["confirmed_fingerprint"] =
+                    json!(text(v, "confirmed_fingerprint", 100, false)?);
+            }
+            crate::deploy::validate(&request)
+                .map_err(|_| fail(400, "请填写有效的 SSH 连接信息"))?;
+            if updating {
+                let config = ctx.app.config.read().await.clone();
+                let version = crate::deploy::verified_version(&ctx.app.root, &config)
+                    .await
+                    .map_err(|_| fail(503, "无法验证最新版本，请稍后重试"))?;
+                if !crate::deploy::newer_version(&version, s(&node, "agent_version")) {
+                    return Err(fail(409, "未检测到可更新的 Agent 版本"));
+                }
+                request["expected_version"] = json!(version);
+            }
+            if route == "admin/connection" {
+                crate::deploy::check_connection(&ctx.app.root, &request, &ctx.app.store)
+                    .await
+                    .map_err(|e| fail(400, e.to_string()))?;
+                ctx.audit("保存 SSH 连接信息", "", &name).await?;
+                if !b(v, "redeploy") {
+                    return Ok(json!({"ok":true}));
+                }
+            }
             if ctx.app.config.read().await["controller_urls"]
                 .as_array()
                 .is_none_or(|a| a.is_empty())
             {
-                return Err(fail(
-                    400,
-                    "请先在管理菜单设置 HTTPS 面板地址，并完成反向代理",
-                ));
+                return Err(fail(400, "请先设置有效 HTTPS 面板地址"));
             }
-            let result = ctx
-                .app
-                .jobs
-                .start(request.clone(), ctx.app.store.clone())
-                .await?;
-            let mut meta = metadata(ctx.app, &id).await?;
-            let mut saved = request.as_object().unwrap().clone();
-            saved.remove("password");
-            saved.remove("node_id");
-            meta.as_object_mut().unwrap().extend(saved);
-            meta_save(ctx.app, &id, &meta).await?;
-            ctx.audit("部署节点", "", s(&request, "name")).await?;
+            let result = ctx.app.jobs.start(request, ctx.app.store.clone()).await?;
+            ctx.audit(
+                if updating {
+                    "更新 Agent"
+                } else {
+                    "部署节点"
+                },
+                "",
+                &name,
+            )
+            .await?;
             Ok(result)
         }
         "admin/node" => {
             let id = ident(v, "id")?;
             let name = text(v, "name", 40, true)?;
-            ctx.app.store.command(json!({"action":"node-status","node":{"id":id,"name":name,"enabled":b(v,"enabled")}})).await?;
-            let mut meta = metadata(ctx.app, &id).await?;
-            meta["region"] = json!(text(v, "region", 40, true)?);
-            meta_save(ctx.app, &id, &meta).await?;
+            let node = json!({"id":id,"name":name,"region":text(v,"region",40,true)?,"public_ip":text(v,"public_ip",64,true)?,"enabled":b(v,"enabled")});
+            ctx.app
+                .store
+                .command(json!({"action":"edit-node","actor_id":user["id"],"node":node}))
+                .await?;
             ctx.audit("编辑节点", "", &name).await?;
             Ok(json!({"ok":true}))
         }
@@ -144,10 +298,50 @@ pub async fn dispatch(ctx: &mut Context<'_>, route: &str, v: &Value) -> Result<V
             let p = json!({"id":if s(v,"id").is_empty(){id()}else{ident(v,"id")?},"name":text(v,"name",40,true)?,"port_limit":integer(v,"port_limit",1,500)?,"traffic_limit_bytes":integer(v,"traffic_limit_bytes",0,1_000_000_000_000_000)?,"period_days":integer(v,"period_days",1,366)?,"price_cents":integer(v,"price_cents",0,9_999_999)?,"reset_price_cents":integer(v,"reset_price_cents",0,9_999_999)?,"node_ids":ids,"enabled":b(v,"enabled")});
             ctx.app
                 .store
-                .command(json!({"action":"plan","plan":p}))
+                .command(json!({"action":"plan","plan":p,"update_existing":b(v,"update_existing")}))
                 .await?;
             ctx.audit("保存套餐", "", s(&p, "name")).await?;
             Ok(p)
+        }
+        "admin/delete-plan" => {
+            let id = ident(v, "id")?;
+            let p = {
+                let mut db = ctx.app.store.pool.acquire().await?;
+                one(
+                    &mut db,
+                    "SELECT name FROM vp_plans WHERE id=?",
+                    &[json!(id)],
+                )
+                .await?
+            };
+            if text(v, "confirm_name", 40, true)? != s(&p, "name") {
+                return Err(fail(400, "请输入正确的套餐名称"));
+            }
+            let result = ctx
+                .app
+                .store
+                .command(json!({"action":"delete-plan","actor_id":user["id"],"id":id}))
+                .await?;
+            ctx.audit("删除套餐商品", "", s(&p, "name")).await?;
+            Ok(result)
+        }
+        "admin/delete-lease" => {
+            let id = ident(v, "id")?;
+            let l = ctx
+                .app
+                .store
+                .command(json!({"action":"lease","lease_id":id}))
+                .await?;
+            if text(v, "confirm_name", 40, true)? != s(&l, "plan_name") {
+                return Err(fail(400, "请输入正确的套餐名称"));
+            }
+            let result = ctx
+                .app
+                .store
+                .command(json!({"action":"admin-delete-lease","actor_id":user["id"],"id":id}))
+                .await?;
+            ctx.audit("删除用户套餐", s(&l, "user_id"), &id).await?;
+            Ok(result)
         }
         "admin/grant" => {
             let uid = ident(v, "user_id")?;
@@ -311,4 +505,41 @@ pub async fn dispatch(ctx: &mut Context<'_>, route: &str, v: &Value) -> Result<V
         }
         _ => Err(fail(404, "接口不存在")),
     }
+}
+
+fn sign_rules(app: &App, payload: &Value) -> Result<String> {
+    use hmac::{Hmac, Mac};
+    let key = std::fs::read(app.root.join("state/app.key"))?;
+    if key.len() != 32 {
+        return Err(fail(503, "加密密钥不可用"));
+    }
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(&key).map_err(|_| fail(503, "签名失败"))?;
+    mac.update(b"vistart-rule-export-v1\0");
+    mac.update(&serde_json::to_vec(payload)?);
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+fn verify_rules(app: &App, payload: &Value, signature: &str) -> Result<()> {
+    let expected = sign_rules(app, payload)?;
+    if signature.len() != 64 || !bool::from(expected.as_bytes().ct_eq(signature.as_bytes())) {
+        return Err(fail(400, "规则文件已被修改，或不属于当前面板"));
+    }
+    Ok(())
+}
+async fn migration_ssh(app: &App, nid: &str) -> Result<Value> {
+    let meta = metadata(app, nid).await?;
+    if s(&meta, "ssh_secret").is_empty() {
+        return Err(fail(400, "请先在目标服务器的连接信息中保存 SSH 密码"));
+    }
+    let mut request: Value = serde_json::from_str(&auth::unseal(app, s(&meta, "ssh_secret"))?)?;
+    if s(&request, "node_id") != nid
+        || request["ssh_host"] != meta["ssh_host"]
+        || request["ssh_port"] != meta["ssh_port"]
+        || request["username"] != meta["username"]
+    {
+        return Err(fail(400, "目标服务器连接信息已改变，请重新保存 SSH 密码"));
+    }
+    for key in ["name", "region", "public_ip"] {
+        request[key] = meta[key].clone();
+    }
+    Ok(request)
 }

@@ -7,22 +7,11 @@ pub async fn snapshot(ctx: &Context<'_>, admin: bool) -> Result<Value> {
     } else {
         Vec::new()
     };
-    let live: HashSet<String> = state["nodes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|n| s(n, "id").to_owned())
-        .collect();
-    for job in &jobs {
-        let job = serde_json::to_value(job)?;
-        if live.contains(s(&job, "node_id")) && job["result"].is_object() {
-            let mut m = metadata(ctx.app, s(&job, "node_id")).await?;
-            m.as_object_mut()
-                .unwrap()
-                .extend(job["result"].as_object().unwrap().clone());
-            meta_save(ctx.app, s(&job, "node_id"), &m).await?;
-        }
-    }
+    let release = if admin {
+        ctx.app.jobs.release_status(false).await
+    } else {
+        Value::Null
+    };
     let mut db = ctx.app.store.pool.acquire().await?;
     let meta: HashMap<String, Value> = rows(&mut db, "SELECT id,value FROM vp_metadata", &[])
         .await?
@@ -38,6 +27,16 @@ pub async fn snapshot(ctx: &Context<'_>, admin: bool) -> Result<Value> {
     let mut samples = HashMap::<(String, String, String, i64), Value>::new();
     for node in state["nodes"].as_array_mut().unwrap() {
         node["meta"] = meta.get(s(node, "id")).cloned().unwrap_or(json!({}));
+        node["meta"]["has_ssh_password"] = json!(!s(&node["meta"], "ssh_secret").is_empty());
+        if let Some(m) = node["meta"].as_object_mut() {
+            m.remove("ssh_secret");
+        }
+        node["update_available"] = json!(
+            admin
+                && s(&release, "status") == "ok"
+                && crate::deploy::newer_version(s(&release, "version"), s(node, "agent_version"))
+        );
+
         node["online"] = json!(b(node, "enabled") && n(node, "last_seen") > now() - 15);
         node["syncing"] = json!(n(node, "applied_revision") < revision);
         node["tcping_supported"] = json!(node["probe"]["target_checks"].is_array());
@@ -81,7 +80,25 @@ pub async fn snapshot(ctx: &Context<'_>, admin: bool) -> Result<Value> {
         let empty = json!({});
         let node = nodes.get(s(a, "node_id")).unwrap_or(&empty);
         let lease = leases.get(s(a, "lease_id")).unwrap_or(&empty);
-        let status = if b(a, "released")
+        let expected = crate::protocol::Rule {
+            id: s(a, "id").into(),
+            user_id: s(lease, "user_id").into(),
+            lease_id: s(a, "lease_id").into(),
+            cycle_id: s(lease, "cycle_id").into(),
+            listen_ip: s(a, "bind_ip").into(),
+            listen_port: n(a, "port") as u16,
+            target_host: s(a, "target_host").into(),
+            target_port: n(a, "target_port") as u16,
+            load_balance: b(a, "load_balance"),
+            targets: serde_json::from_value(a["targets"].clone()).unwrap_or_default(),
+            expires_at: n(lease, "expires_at"),
+        };
+        let pending = if let Some(applied) = node["applied_rules"].as_object() {
+            applied.get(s(a, "id")).and_then(Value::as_str) != Some(expected.fingerprint().as_str())
+        } else {
+            b(node, "syncing")
+        };
+        let apply_status = if b(a, "released")
             || lease == &empty
             || b(lease, "ended")
             || b(lease, "manual_paused")
@@ -91,9 +108,11 @@ pub async fn snapshot(ctx: &Context<'_>, admin: bool) -> Result<Value> {
                 && n(lease, "used_up") + n(lease, "used_down") >= n(lease, "traffic_limit_bytes"))
         {
             "paused"
+        } else if s(a, "target_host").is_empty() {
+            "unconfigured"
         } else if !b(node, "online") {
             "offline"
-        } else if b(node, "syncing") {
+        } else if pending {
             "pending"
         } else if node["errors"].as_array().is_some_and(|errors| {
             errors
@@ -101,10 +120,26 @@ pub async fn snapshot(ctx: &Context<'_>, admin: bool) -> Result<Value> {
                 .any(|e| s(e, "rule_id").is_empty() || s(e, "rule_id") == s(a, "id"))
         }) {
             "apply_failed"
-        } else if !b(node, "tcping_supported") {
-            "unsupported"
+        } else if let Some(active) = node["active_rules"].as_array() {
+            if active.iter().any(|id| id == &a["id"]) {
+                "listening"
+            } else {
+                "not_listening"
+            }
         } else {
-            "checking"
+            "accepted"
+        };
+        a["apply_status"] = json!(apply_status);
+        let status = match apply_status {
+            "listening" | "accepted" => {
+                if b(node, "tcping_supported") {
+                    "checking"
+                } else {
+                    "unsupported"
+                }
+            }
+            "not_listening" => "apply_failed",
+            other => other,
         };
         let targets = if b(a, "load_balance") {
             a["targets"].clone()
@@ -197,6 +232,8 @@ pub async fn snapshot(ctx: &Context<'_>, admin: bool) -> Result<Value> {
             .unwrap()
             .retain(|p| b(p, "enabled") || planids.contains(s(p, "id")));
         for n in state["nodes"].as_array_mut().unwrap() {
+            n.as_object_mut().unwrap().remove("active_rules");
+            n.as_object_mut().unwrap().remove("applied_rules");
             n["meta"] =
                 json!({"region":s(&n["meta"],"region"),"public_ip":s(&n["meta"],"public_ip")});
             n.as_object_mut().unwrap().remove("applied_revision");
@@ -248,6 +285,7 @@ pub async fn snapshot(ctx: &Context<'_>, admin: bool) -> Result<Value> {
     };
     state["settings"] = json!({"site_name":setting(ctx.app,"site_name",json!("Vistart Ports")).await?,"registration":setting(ctx.app,"registration",json!(false)).await?,"email_verification":setting(ctx.app,"registration_email_verification",json!(false)).await?,"controller_url":config["controller_urls"].as_array().and_then(|a|a.first()).cloned().unwrap_or(json!("")),"public_origin":config["origin"],"version":crate::VERSION});
     state["jobs"] = json!(jobs);
+    state["agent_release"] = release;
     state["user"] = safe_account(user.clone());
     state["now"] = json!(now());
     Ok(state)

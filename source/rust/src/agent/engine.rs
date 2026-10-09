@@ -156,6 +156,7 @@ impl Engine {
         for (id, f) in map.iter() {
             let old = f.active.load();
             if let Some(r) = wanted.get(id)
+                && !f.task.is_finished()
                 && old.rule.listen_ip == r.listen_ip
                 && old.rule.listen_port == r.listen_port
                 && old.rule.targets() == r.targets()
@@ -208,15 +209,29 @@ impl Engine {
         let c = cancel.clone();
         let cur = cursor.clone();
         let task = tokio::spawn(async move {
-            let t = tokio::spawn(tcp_loop(e.clone(), a.clone(), c.clone(), cur.clone(), tcp));
-            let u = tokio::spawn(udp_loop(e, a, c, cur, udp));
-            let _ = tokio::join!(t, u);
+            let mut t = tokio::spawn(tcp_loop(e.clone(), a.clone(), c.clone(), cur.clone(), tcp));
+            let mut u = tokio::spawn(udp_loop(e, a, c.clone(), cur, udp));
+            // A paired port is healthy only while both protocol loops are alive.
+            tokio::select! {
+                _ = &mut t => { c.cancel(); let _ = u.await; },
+                _ = &mut u => { c.cancel(); let _ = t.await; },
+            }
         });
         Ok(Forward {
             active,
             cancel,
             task,
         })
+    }
+    pub async fn active_rule_ids(&self) -> Vec<String> {
+        let map = self.rules.lock().await;
+        let mut ids: Vec<_> = map
+            .iter()
+            .filter(|(_, f)| !f.task.is_finished() && !f.cancel.is_cancelled())
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
     }
     pub async fn target_checks(&self) -> Vec<TargetCheck> {
         self.checks.lock().await.clone()
