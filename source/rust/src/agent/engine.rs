@@ -11,6 +11,7 @@ use arc_swap::ArcSwap;
 use std::{
     collections::{BTreeMap, HashMap},
     net::{IpAddr, SocketAddr},
+    os::fd::{AsRawFd, RawFd},
     sync::{
         Arc,
         atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering},
@@ -495,15 +496,46 @@ async fn stream(
     if tune(&remote, memory.buffer).is_err() {
         return;
     }
-    let copied = {
+    // These descriptors remain owned by client/remote until both scoped pump
+    // futures and the watcher have been dropped; no watcher is spawned.
+    let client_fd = client.as_raw_fd();
+    let remote_fd = remote.as_raw_fd();
+    let copied = async {
         let (cr, cw) = client.split();
         let (rr, rw) = remote.split();
-        tokio::try_join!(pump(cr, rw, a.clone(), true), pump(rr, cw, a, false))
-    };
+        let up = pump(cr, rw, a.clone(), true);
+        let down = pump(rr, cw, a, false);
+        tokio::pin!(up, down);
+        // Full-duplex traffic has no additional polling. After the first EOF,
+        // the completed read half no longer observes a later RST, while the
+        // opposite pump may be waiting for data or bandwidth. Watch for that
+        // terminal error without imposing a timeout on healthy half-closes.
+        tokio::select! {
+            result = &mut up => {
+                result?;
+                tokio::select! {
+                    result = down => result,
+                    result = half_close_error(client_fd, remote_fd) => Err(result.into()),
+                }
+            },
+            result = &mut down => {
+                result?;
+                tokio::select! {
+                    result = up => result,
+                    result = half_close_error(client_fd, remote_fd) => Err(result.into()),
+                }
+            },
+        }
+    }
+    .await;
     if copied.is_ok()
         && async {
             loop {
-                if send_queue_empty(&client)? && send_queue_empty(&remote)? {
+                // Inspect both sides even while one peer has not acknowledged
+                // its queue, so a terminal socket cannot retain the reservation.
+                let client_empty = send_queue_empty(client_fd)?;
+                let remote_empty = send_queue_empty(remote_fd)?;
+                if client_empty && remote_empty {
                     return Ok::<_, std::io::Error>(());
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -523,15 +555,97 @@ async fn stream(
     drop(client);
     drop(memory);
 }
-fn send_queue_empty(socket: &TcpStream) -> std::io::Result<bool> {
-    use std::os::fd::AsRawFd;
+// Called only inside stream's scoped select while both socket owners live.
+async fn half_close_error(client: RawFd, remote: RawFd) -> std::io::Error {
+    loop {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        for fd in [client, remote] {
+            // SO_ERROR also exposes soft network errors. Inspect it only for
+            // TCP_CLOSE; a transient route error must not kill a live stream.
+            match tcp_state(fd) {
+                Ok(TCP_CLOSE) => (),
+                Ok(_) => continue,
+                Err(error) => return error,
+            }
+            if let Err(error) = send_queue_empty(fd) {
+                return error;
+            }
+            let mut error: libc::c_int = 0;
+            let mut len = std::mem::size_of_val(&error) as libc::socklen_t;
+            // SO_ERROR consumes the pending socket error. If present, return
+            // it immediately so this relay closes; no error is silently lost.
+            if unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_ERROR,
+                    (&mut error as *mut libc::c_int).cast(),
+                    &mut len,
+                )
+            } < 0
+            {
+                return std::io::Error::last_os_error();
+            }
+            if len as usize != std::mem::size_of_val(&error) {
+                return std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "SO_ERROR returned an invalid length",
+                );
+            }
+            if error != 0 {
+                return std::io::Error::from_raw_os_error(error);
+            }
+        }
+    }
+}
+fn send_queue_empty(fd: RawFd) -> std::io::Result<bool> {
     let mut queued: libc::c_int = 0;
     // TIOCOUTQ writes one int; socket remains owned and open for this call.
-    if unsafe { libc::ioctl(socket.as_raw_fd(), libc::TIOCOUTQ, &mut queued) } < 0 {
+    if unsafe { libc::ioctl(fd, libc::TIOCOUTQ, &mut queued) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(queued == 0)
+    if queued == 0 {
+        return Ok(true);
+    }
+    // TIOCOUTQ is based on TCP sequence counters. After a reset, Linux can
+    // report stale unacknowledged bytes even though TCP_CLOSE cannot transmit
+    // again. Waiting for that counter to reach zero leaks both sockets, the
+    // connection permit and its reserved memory budget.
+    if tcp_state(fd)? == TCP_CLOSE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "TCP connection closed before send queue drain",
+        ));
+    }
+    Ok(false)
 }
+const TCP_CLOSE: u8 = 7; // Linux include/net/tcp_states.h
+fn tcp_state(fd: RawFd) -> std::io::Result<u8> {
+    let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of_val(&info) as libc::socklen_t;
+    // Owned stack storage with a matching length; only read tcpi_state after
+    // the kernel confirms at least that first byte has been written.
+    if unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            (&mut info as *mut libc::tcp_info).cast(),
+            &mut len,
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    if len == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "TCP_INFO did not include the connection state",
+        ));
+    }
+    Ok(info.tcpi_state)
+}
+
 async fn pump<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin>(
     mut src: R,
     mut dst: W,

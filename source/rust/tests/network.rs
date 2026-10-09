@@ -642,3 +642,558 @@ async fn wildcard_multinic_preserves_udp_sources_and_live_tcp() {
     drop(j);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn reset_after_half_close_releases_draining_connections() {
+    let dir = std::env::temp_dir().join(format!("forward-reset-drain-{}", id()));
+    std::fs::create_dir(&dir).unwrap();
+    let journal = Journal::open(&dir.join("traffic.json")).unwrap();
+    let engine = Engine::new(
+        journal.clone(),
+        Arc::new(Resolver::new(vec!["127.0.0.0/8".parse().unwrap()], vec![])),
+        2,
+        2,
+    );
+    let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_port = backend.local_addr().unwrap().port();
+    let backend_task = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = backend.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut request = [0u8; 1];
+                if socket.read(&mut request).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                let mut eof = [0u8; 1];
+                assert_eq!(socket.read(&mut eof).await.unwrap(), 0);
+                socket.write_all(&vec![0x37; 64 * 1024]).await.unwrap();
+                socket.shutdown().await.unwrap();
+            });
+        }
+    });
+    let temporary = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = temporary.local_addr().unwrap().port();
+    drop(temporary);
+    let config = Config {
+        version: 1,
+        revision: 1,
+        valid_for_seconds: 30,
+        rules: vec![Rule {
+            id: "reset-drain".into(),
+            lease_id: "lease".into(),
+            cycle_id: "cycle".into(),
+            listen_ip: "127.0.0.1".into(),
+            listen_port: port,
+            target_host: "127.0.0.1".into(),
+            target_port,
+            expires_at: now() + 300,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert!(engine.apply(&config).await.is_empty());
+    let rounds = std::env::var("VISTART_RESET_ROUNDS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(64)
+        .clamp(1, 10_000);
+    for round in 0..rounds {
+        assert!(engine.apply(&config).await.is_empty());
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        let mut client = socket.connect(([127, 0, 0, 1], port).into()).await.unwrap();
+        client.write_all(b"x").await.unwrap();
+        client.shutdown().await.unwrap();
+        // Both relay pumps finish, but the small unread client window leaves
+        // bytes queued for ACK. Reset only after reaching that drain phase.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while journal.meter("reset-drain", "cycle").counter().down < (round + 1) * 64 * 1024 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        socket2::SockRef::from(&client)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+        drop(client);
+        counts(&engine, "reset-drain", 0, 0).await;
+        assert!(
+            engine
+                .lease_usage()
+                .iter()
+                .all(|u| u.tcp_active == 0 && u.tcp_waiting == 0)
+        );
+    }
+    // A final complete response proves capacity is reusable after many resets.
+    let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    client.write_all(b"x").await.unwrap();
+    client.shutdown().await.unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response, vec![0x37; 64 * 1024]);
+    counts(&engine, "reset-drain", 0, 0).await;
+    engine.close().await;
+    backend_task.abort();
+    let _ = backend_task.await;
+    drop(engine);
+    drop(journal);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn target_reset_after_half_close_releases_connection_budget() {
+    let dir = std::env::temp_dir().join(format!("forward-target-reset-{}", id()));
+    std::fs::create_dir(&dir).unwrap();
+    let journal = Journal::open(&dir.join("traffic.json")).unwrap();
+    let engine = Engine::new(
+        journal.clone(),
+        Arc::new(Resolver::new(vec!["127.0.0.0/8".parse().unwrap()], vec![])),
+        2,
+        2,
+    );
+    let backend = tokio::net::TcpSocket::new_v4().unwrap();
+    backend.set_recv_buffer_size(4096).unwrap();
+    backend.bind(([127, 0, 0, 1], 0).into()).unwrap();
+    let backend = backend.listen(16).unwrap();
+    let target_port = backend.local_addr().unwrap().port();
+    let temporary = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = temporary.local_addr().unwrap().port();
+    drop(temporary);
+    let mut config = Config {
+        version: 1,
+        revision: 1,
+        valid_for_seconds: 30,
+        rules: vec![Rule {
+            id: "target-reset".into(),
+            lease_id: "lease".into(),
+            cycle_id: "cycle".into(),
+            listen_ip: "127.0.0.1".into(),
+            listen_port: port,
+            target_host: "127.0.0.1".into(),
+            target_port,
+            expires_at: now() + 300,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert!(engine.apply(&config).await.is_empty());
+    let rounds = std::env::var("VISTART_RESET_ROUNDS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(64)
+        .clamp(1, 10_000);
+    for round in 0..rounds {
+        assert!(engine.apply(&config).await.is_empty());
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        client.write_all(&vec![0x37; 64 * 1024]).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut peer = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let (peer, _) = backend.accept().await.unwrap();
+                let mut byte = [0u8; 1];
+                // Skip the control plane's periodic connect-only target probe.
+                if peer.peek(&mut byte).await.unwrap_or(0) > 0 {
+                    break peer;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        peer.write_all(b"ready").await.unwrap();
+        peer.shutdown().await.unwrap();
+        let mut reply = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply, b"ready");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while journal.meter("target-reset", "cycle").counter().up < (round + 1) * 64 * 1024 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        socket2::SockRef::from(&peer)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+        drop(peer);
+        counts(&engine, "target-reset", 0, 0).await;
+        assert!(
+            engine
+                .lease_usage()
+                .iter()
+                .all(|u| u.tcp_active == 0 && u.tcp_waiting == 0)
+        );
+    }
+    config.rules[0].target_port = echo().await;
+    config.revision += 1;
+    assert!(engine.apply(&config).await.is_empty());
+    drop(tcp_peer(port).await);
+    counts(&engine, "target-reset", 0, 0).await;
+    engine.close().await;
+    drop(engine);
+    drop(journal);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn all_rules_release_shared_tcp_udp_capacity_and_reuse_ports() {
+    use vistart_forward::protocol::{Budget, LeaseGrant, Limits};
+    let dir = std::env::temp_dir().join(format!("forward-all-rules-{}", id()));
+    std::fs::create_dir(&dir).unwrap();
+    let journal = Journal::open(&dir.join("traffic.json")).unwrap();
+    // Exactly one connection/session per rule; no spare capacity to hide leaks.
+    let engine = Engine::new(
+        journal.clone(),
+        Arc::new(Resolver::new(vec!["127.0.0.0/8".parse().unwrap()], vec![])),
+        12,
+        12,
+    );
+    let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_port = backend.local_addr().unwrap().port();
+    let backend_task = tokio::spawn(async move {
+        loop {
+            let (mut peer, _) = backend.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut request = [0u8; 1];
+                if peer.read(&mut request).await.unwrap_or(0) == 0 {
+                    return; // Connect-only health probe.
+                }
+                assert_eq!(peer.read(&mut request).await.unwrap(), 0);
+                peer.write_all(&vec![0x37; 64 * 1024]).await.unwrap();
+                peer.shutdown().await.unwrap();
+            });
+        }
+    });
+    let policy = Limits {
+        tcp_limit: 6,
+        udp_limit: 6,
+        ..Default::default()
+    };
+    let mut config = Config {
+        version: 1,
+        revision: 1,
+        valid_for_seconds: 30,
+        ..Default::default()
+    };
+    let mut reserved = Vec::new();
+    for i in 0..12 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        config.rules.push(Rule {
+            id: format!("rule-{i}"),
+            lease_id: format!("lease-{}", i % 2),
+            cycle_id: "cycle".into(),
+            listen_ip: "127.0.0.1".into(),
+            listen_port: listener.local_addr().unwrap().port(),
+            target_host: "127.0.0.1".into(),
+            target_port,
+            expires_at: now() + 300,
+            limits: policy.clone(),
+            ..Default::default()
+        });
+        reserved.push(listener);
+    }
+    drop(reserved);
+    for i in 0..2 {
+        config.lease_limits.push(LeaseGrant {
+            lease_id: format!("lease-{i}"),
+            id: format!("grant-{i}"),
+            policy: policy.clone(),
+            budget: Budget {
+                tcp: 6,
+                udp: 6,
+                ..Default::default()
+            },
+        });
+    }
+    for round in 0..32u64 {
+        assert!(engine.apply(&config).await.is_empty());
+        let mut clients = Vec::new();
+        for rule in &config.rules {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.set_recv_buffer_size(4096).unwrap();
+            let mut client = socket
+                .connect(([127, 0, 0, 1], rule.listen_port).into())
+                .await
+                .unwrap();
+            client.write_all(b"x").await.unwrap();
+            client.shutdown().await.unwrap();
+            clients.push(client);
+        }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if config.rules.iter().all(|r| {
+                    journal.meter(&r.id, "cycle").counter().down == (round + 1) * 64 * 1024
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        for rule in &config.rules {
+            counts(&engine, &rule.id, 1, 0).await;
+        }
+        let usage = engine.lease_usage();
+        assert_eq!(usage.len(), 2);
+        assert!(
+            usage
+                .iter()
+                .all(|u| u.tcp_active == 6 && u.tcp_waiting == 0)
+        );
+        // Every rule alternates between a reset and a complete normal FIN.
+        let mut readers = tokio::task::JoinSet::new();
+        for (i, mut client) in clients.into_iter().enumerate() {
+            if (i + round as usize).is_multiple_of(2) {
+                socket2::SockRef::from(&client)
+                    .set_linger(Some(Duration::ZERO))
+                    .unwrap();
+                drop(client);
+            } else {
+                readers.spawn(async move {
+                    let mut response = Vec::new();
+                    tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut response))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(response, vec![0x37; 64 * 1024]);
+                });
+            }
+        }
+        while let Some(result) = readers.join_next().await {
+            result.unwrap();
+        }
+        for rule in &config.rules {
+            counts(&engine, &rule.id, 0, 0).await;
+        }
+        assert!(
+            engine
+                .lease_usage()
+                .iter()
+                .all(|u| u.tcp_active == 0 && u.tcp_waiting == 0)
+        );
+    }
+
+    // All rules change target, then retain live TCP while real UDP idle timers expire.
+    let target = echo().await;
+    for rule in &mut config.rules {
+        rule.target_port = target;
+    }
+    config.revision += 1;
+    assert!(engine.apply(&config).await.is_empty());
+    let mut tcp = Vec::new();
+    let mut udp = Vec::new();
+    for rule in &config.rules {
+        tcp.push(tcp_peer(rule.listen_port).await);
+        udp.push(udp_peer(rule.listen_port).await);
+        counts(&engine, &rule.id, 1, 1).await;
+    }
+    assert!(
+        engine
+            .lease_usage()
+            .iter()
+            .all(|u| u.tcp_active == 6 && u.udp_active == 6)
+    );
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(engine.apply(&config).await.is_empty());
+    }
+    for rule in &config.rules {
+        counts(&engine, &rule.id, 1, 0).await;
+    }
+    assert!(
+        engine
+            .lease_usage()
+            .iter()
+            .all(|u| u.tcp_active == 6 && u.udp_active == 0)
+    );
+    drop(udp);
+    let mut udp = Vec::new();
+    for rule in &config.rules {
+        udp.push(udp_peer(rule.listen_port).await);
+        counts(&engine, &rule.id, 1, 1).await;
+    }
+    let original = config.rules.clone();
+    config.rules.drain(..6);
+    config.revision += 1;
+    assert!(engine.apply(&config).await.is_empty());
+    assert_eq!(engine.rule_connections().await.len(), 6);
+    let mut byte = [0u8; 1];
+    for (i, stream) in tcp.iter_mut().enumerate() {
+        if i < 6 {
+            let closed = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+                .await
+                .unwrap();
+            assert!(closed.is_err() || closed.unwrap() == 0);
+        } else {
+            stream.write_all(b"x").await.unwrap();
+            stream.read_exact(&mut byte).await.unwrap();
+            assert_eq!(byte, *b"x");
+            counts(&engine, &original[i].id, 1, 1).await;
+        }
+    }
+    assert!(
+        engine
+            .lease_usage()
+            .iter()
+            .all(|u| u.tcp_active == 3 && u.udp_active == 3)
+    );
+    engine.suspend().await;
+    assert!(engine.rule_connections().await.is_empty());
+    assert!(engine.lease_usage().is_empty());
+    drop((tcp, udp));
+
+    // Re-add the same ports and fully consume both grants again after deletion.
+    config.rules = original;
+    config.revision += 1;
+    assert!(engine.apply(&config).await.is_empty());
+    let mut tcp = Vec::new();
+    let mut udp = Vec::new();
+    for rule in &config.rules {
+        tcp.push(tcp_peer(rule.listen_port).await);
+        udp.push(udp_peer(rule.listen_port).await);
+        counts(&engine, &rule.id, 1, 1).await;
+    }
+    assert!(
+        engine
+            .lease_usage()
+            .iter()
+            .all(|u| u.tcp_active == 6 && u.udp_active == 6)
+    );
+    engine.close().await;
+    assert!(engine.rule_connections().await.is_empty());
+    assert!(engine.lease_usage().is_empty());
+    drop((tcp, udp));
+    backend_task.abort();
+    let _ = backend_task.await;
+    drop(engine);
+    drop(journal);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn one_sided_eof_then_reset_releases_while_other_peer_stays_open() {
+    let dir = std::env::temp_dir().join(format!("forward-one-sided-reset-{}", id()));
+    std::fs::create_dir(&dir).unwrap();
+    let journal = Journal::open(&dir.join("traffic.json")).unwrap();
+    let engine = Engine::new(
+        journal.clone(),
+        Arc::new(Resolver::new(vec!["127.0.0.0/8".parse().unwrap()], vec![])),
+        1,
+        1,
+    );
+    let backend = tokio::net::TcpSocket::new_v4().unwrap();
+    backend.set_recv_buffer_size(4096).unwrap();
+    backend.bind(([127, 0, 0, 1], 0).into()).unwrap();
+    let backend = backend.listen(16).unwrap();
+    let temporary = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = temporary.local_addr().unwrap().port();
+    drop(temporary);
+    let config = Config {
+        version: 1,
+        revision: 1,
+        valid_for_seconds: 30,
+        rules: vec![Rule {
+            id: "one-sided".into(),
+            lease_id: "lease".into(),
+            cycle_id: "cycle".into(),
+            listen_ip: "127.0.0.1".into(),
+            listen_port: port,
+            target_host: "127.0.0.1".into(),
+            target_port: backend.local_addr().unwrap().port(),
+            expires_at: now() + 300,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    for reset_client in [true, false] {
+        for pending_data in [false, true] {
+            assert!(engine.apply(&config).await.is_empty());
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.set_recv_buffer_size(4096).unwrap();
+            let mut client = socket.connect(([127, 0, 0, 1], port).into()).await.unwrap();
+            client.write_all(b"x").await.unwrap();
+            let mut peer = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let (mut peer, _) = backend.accept().await.unwrap();
+                    let mut byte = [0u8; 1];
+                    if peer.read(&mut byte).await.unwrap_or(0) > 0 {
+                        break peer;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let before = journal.meter("one-sided", "cycle").counter();
+            let mut byte = [0u8; 1];
+            if reset_client {
+                client.shutdown().await.unwrap();
+                assert_eq!(peer.read(&mut byte).await.unwrap(), 0);
+                if pending_data {
+                    peer.write_all(&vec![0x37; 64 * 1024]).await.unwrap();
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while journal.meter("one-sided", "cycle").counter().down
+                            < before.down + 64 * 1024
+                        {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                }
+                counts(&engine, "one-sided", 1, 0).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                socket2::SockRef::from(&client)
+                    .set_linger(Some(Duration::ZERO))
+                    .unwrap();
+                drop(client);
+                // peer stays open; do not let its EOF or 300s read timeout
+                // accidentally make the reset-reclamation assertion pass.
+                counts(&engine, "one-sided", 0, 0).await;
+                drop(peer);
+            } else {
+                peer.shutdown().await.unwrap();
+                assert_eq!(client.read(&mut byte).await.unwrap(), 0);
+                if pending_data {
+                    client.write_all(&vec![0x37; 64 * 1024]).await.unwrap();
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while journal.meter("one-sided", "cycle").counter().up
+                            < before.up + 64 * 1024
+                        {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                }
+                counts(&engine, "one-sided", 1, 0).await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                socket2::SockRef::from(&peer)
+                    .set_linger(Some(Duration::ZERO))
+                    .unwrap();
+                drop(peer);
+                counts(&engine, "one-sided", 0, 0).await;
+                drop(client);
+            }
+            assert!(
+                engine
+                    .lease_usage()
+                    .iter()
+                    .all(|u| u.tcp_active == 0 && u.tcp_waiting == 0)
+            );
+        }
+    }
+    engine.close().await;
+    drop(engine);
+    drop(journal);
+    std::fs::remove_dir_all(dir).unwrap();
+}
