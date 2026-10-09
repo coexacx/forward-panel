@@ -294,7 +294,7 @@ impl Jobs {
             &client,
             req,
             "cat > /etc/systemd/system/vistart-agent.service",
-            include_bytes!("agent.service"),
+            agent_service(lines[3].parse::<u64>().unwrap_or_default()).as_bytes(),
         )
         .await?;
         store
@@ -786,4 +786,14 @@ pub async fn occupied_ports(root: &Path, req: &Value) -> Result<Vec<i64>> {
         }
     }
     Ok(ports.into_iter().collect())
+}
+
+fn agent_service(memory_kib: u64) -> String {
+    include_str!("agent.service").replace(
+        "MemoryMax=128M",
+        &format!(
+            "MemoryMax={}M",
+            crate::agent::memory::service_memory_mib(memory_kib)
+        ),
+    )
 }

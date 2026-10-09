@@ -1,6 +1,7 @@
 use super::{
     journal::{Journal, Meter},
     limits::Gate,
+    memory::{Memory, TcpMemory, UDP_BUFFER},
     resolver::Resolver,
 };
 use crate::{now, protocol::*, valid_id, valid_target};
@@ -17,7 +18,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream, UdpSocket},
+    net::{TcpListener, TcpSocket, TcpStream, UdpSocket},
     sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc},
     task::{JoinHandle, JoinSet},
 };
@@ -71,6 +72,7 @@ pub struct Engine {
     stop: CancellationToken,
     checks: Mutex<Vec<TargetCheck>>,
     probes: Arc<Semaphore>,
+    memory: Memory,
 }
 impl Engine {
     pub fn new(
@@ -91,6 +93,7 @@ impl Engine {
             stop: CancellationToken::new(),
             checks: Mutex::new(Vec::new()),
             probes: Arc::new(Semaphore::new(8)),
+            memory: Memory::discover(),
         });
         let weak = Arc::downgrade(&e);
         tokio::spawn(async move {
@@ -249,8 +252,23 @@ impl Engine {
     }
     async fn start(self: &Arc<Self>, r: Rule) -> Result<Forward> {
         let addr = SocketAddr::new(r.listen_ip.parse()?, r.listen_port);
-        let tcp = TcpListener::bind(addr).await?;
+        let listener_memory = self
+            .memory
+            .listener()
+            .ok_or_else(|| anyhow::anyhow!("socket memory budget exhausted"))?;
+        let socket = if addr.is_ipv4() {
+            TcpSocket::new_v4()?
+        } else {
+            TcpSocket::new_v6()?
+        };
+        socket.set_reuseaddr(true)?;
+        socket.set_send_buffer_size(64 * 1024)?;
+        // Leave window scaling negotiation to Linux; size the accepted socket
+        // before any task can read/write it. Bound the pending accept queue.
+        socket.bind(addr)?;
+        let tcp = socket.listen(16)?;
         let udp = Arc::new(UdpSocket::bind(addr).await?);
+        tune_udp(&udp)?;
         let active = Arc::new(ArcSwap::from_pointee(Active {
             meter: self.journal.meter(&r.id, &r.cycle_id),
             gate: self.leases.lock().unwrap()[&r.lease_id].clone(),
@@ -264,6 +282,7 @@ impl Engine {
         let c = cancel.clone();
         let cur = cursor.clone();
         let task = tokio::spawn(async move {
+            let _listener_memory = listener_memory;
             let mut t = tokio::spawn(tcp_loop(e.clone(), a.clone(), c.clone(), cur.clone(), tcp));
             let mut u = tokio::spawn(udp_loop(e, a, c.clone(), cur, udp));
             // A paired port is healthy only while both protocol loops are alive.
@@ -388,15 +407,29 @@ fn ordered(a: &ArcSwap<Active>, cursor: &AtomicUsize) -> Vec<Target> {
     }
     list
 }
-fn tune(c: &TcpStream) {
+fn tune_buffers(sock: &socket2::SockRef<'_>, bytes: usize) -> std::io::Result<()> {
+    sock.set_send_buffer_size(bytes)?;
+    sock.set_recv_buffer_size(bytes)?;
+    Ok(())
+}
+fn tune_udp(c: &UdpSocket) -> std::io::Result<()> {
+    tune_buffers(&socket2::SockRef::from(c), UDP_BUFFER)
+}
+fn tune(c: &TcpStream, bytes: usize) -> std::io::Result<()> {
     let _ = c.set_nodelay(true);
     let sock = socket2::SockRef::from(c);
+    tune_buffers(&sock, bytes)?;
+    // Error/cancellation must release queued kernel data before the memory
+    // reservation is reused. Successful streams disable this after ACK drain.
+    sock.set_linger(Some(Duration::ZERO))?;
+    let _ = sock.set_tcp_notsent_lowat(64 * 1024);
     let _ = sock.set_tcp_keepalive(
         &socket2::TcpKeepalive::new()
             .with_time(Duration::from_secs(30))
             .with_interval(Duration::from_secs(10))
             .with_retries(3),
     );
+    Ok(())
 }
 async fn tcp_loop(
     e: Arc<Engine>,
@@ -411,7 +444,13 @@ async fn tcp_loop(
          _=cancel.cancelled()=>break,
          Some(_)=tasks.join_next(),if !tasks.is_empty()=>(),
          result=listener.accept()=>match result{
-          Ok((client,_))=>{let Ok(slot)=e.tcp.clone().try_acquire_owned()else{drop(client);continue};let e=e.clone();let a=a.clone();let c=cancel.clone();let targets=ordered(&a,&cursor);tasks.spawn(async move{let _slot=slot;tokio::select!{_=c.cancelled()=>(),_=stream(e,a,client,targets)=>()}});},
+          Ok((client,_))=>{
+           let Ok(slot)=e.tcp.clone().try_acquire_owned()else{drop(client);continue};
+           let Some(memory)=e.memory.tcp()else{drop(client);continue};
+           if tune(&client,memory.buffer).is_err(){continue;}
+           let e=e.clone();let a=a.clone();let c=cancel.clone();let targets=ordered(&a,&cursor);
+           tasks.spawn(async move{let _slot=slot;tokio::select!{_=c.cancelled()=>(),_=stream(e,a,client,targets,memory)=>()}});
+          },
           Err(_)=>tokio::time::sleep(Duration::from_millis(50)).await
          }
         }
@@ -424,6 +463,7 @@ async fn stream(
     a: Arc<ArcSwap<Active>>,
     mut client: TcpStream,
     targets: Vec<Target>,
+    memory: TcpMemory,
 ) {
     let gate = a.load().gate.clone();
     let Some(_lease_slot) = gate.tcp().await else {
@@ -431,12 +471,21 @@ async fn stream(
     };
     let dial = async {
         for t in targets {
-            if let Ok(ip) = e.resolver.resolve(&t.host).await
-                && let Ok(Ok(c)) =
-                    tokio::time::timeout(Duration::from_secs(3), TcpStream::connect((ip, t.port)))
-                        .await
-            {
-                return Ok(c);
+            if let Ok(ip) = e.resolver.resolve(&t.host).await {
+                let socket = if ip.is_ipv4() {
+                    TcpSocket::new_v4()?
+                } else {
+                    TcpSocket::new_v6()?
+                };
+                tune_buffers(&socket2::SockRef::from(&socket), memory.buffer)?;
+                if let Ok(Ok(c)) = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    socket.connect((ip, t.port).into()),
+                )
+                .await
+                {
+                    return Ok(c);
+                }
             }
         }
         bail!("unreachable")
@@ -445,11 +494,45 @@ async fn stream(
         return;
     };
     let _connection = ConnectionGuard::enter(a.load().connections.tcp.clone());
-    tune(&client);
-    tune(&remote);
-    let (cr, cw) = client.split();
-    let (rr, rw) = remote.split();
-    let _ = tokio::try_join!(pump(cr, rw, a.clone(), true), pump(rr, cw, a, false));
+    if tune(&remote, memory.buffer).is_err() {
+        return;
+    }
+    let copied = {
+        let (cr, cw) = client.split();
+        let (rr, rw) = remote.split();
+        tokio::try_join!(pump(cr, rw, a.clone(), true), pump(rr, cw, a, false))
+    };
+    if copied.is_ok()
+        && async {
+            loop {
+                if send_queue_empty(&client)? && send_queue_empty(&remote)? {
+                    return Ok::<_, std::io::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+        .await
+        .is_ok()
+    {
+        // Keep the reservation while a slow reader drains; expiry/cancellation
+        // still closes the stream. Do not time out a healthy half-closed stream.
+        // Both payload queues have been acknowledged. Preserve normal FIN
+        // semantics and half-close; error/cancellation retains abortive close.
+        let _ = socket2::SockRef::from(&client).set_linger(None);
+        let _ = socket2::SockRef::from(&remote).set_linger(None);
+    }
+    drop(remote);
+    drop(client);
+    drop(memory);
+}
+fn send_queue_empty(socket: &TcpStream) -> std::io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let mut queued: libc::c_int = 0;
+    // TIOCOUTQ writes one int; socket remains owned and open for this call.
+    if unsafe { libc::ioctl(socket.as_raw_fd(), libc::TIOCOUTQ, &mut queued) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(queued == 0)
 }
 async fn pump<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin>(
     mut src: R,
@@ -525,6 +608,9 @@ async fn udp_session(
     mut rx: mpsc::Receiver<Packet>,
 ) {
     let gate = a.load().gate.clone();
+    let Some(_memory) = e.memory.udp() else {
+        return;
+    };
     let mut selected = None;
     for t in ordered(&a, &cursor) {
         if let Ok(ip) = e.resolver.resolve(&t.host).await {
@@ -537,6 +623,7 @@ async fn udp_session(
     };
     async fn connect(ip: IpAddr, port: u16) -> Result<UdpSocket> {
         let s = UdpSocket::bind(if ip.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).await?;
+        tune_udp(&s)?;
         s.connect((ip, port)).await?;
         Ok(s)
     }

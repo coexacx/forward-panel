@@ -461,3 +461,71 @@ async fn live_rule_counts_survive_refresh_and_release_on_idle_close_and_retarget
     drop(j);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+async fn slow_half_closed_reader_receives_every_byte_without_reset() {
+    // Large transfer and a fully queued half-close whose reader waits >15s.
+    for (size, wait_ms) in [(512 * 1024, 300), (32 * 1024, 16000)] {
+        let dir = std::env::temp_dir().join(format!("forward-slow-close-{}", id()));
+        std::fs::create_dir(&dir).unwrap();
+        let j = Journal::open(&dir.join("traffic.json")).unwrap();
+        let e = Engine::new(
+            j.clone(),
+            Arc::new(Resolver::new(vec!["127.0.0.0/8".parse().unwrap()], vec![])),
+            8,
+            8,
+        );
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = backend.local_addr().unwrap().port();
+        let sender = tokio::spawn(async move {
+            let (mut c, _) = backend.accept().await.unwrap();
+            let mut request = Vec::new();
+            c.read_to_end(&mut request).await.unwrap();
+            assert_eq!(request, b"request");
+            c.write_all(&vec![0x53; size]).await.unwrap();
+            c.shutdown().await.unwrap();
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let cfg = Config {
+            version: 1,
+            valid_for_seconds: 30,
+            rules: vec![Rule {
+                id: "slow".into(),
+                lease_id: "lease".into(),
+                cycle_id: "cycle".into(),
+                listen_ip: "127.0.0.1".into(),
+                listen_port: port,
+                target_host: "127.0.0.1".into(),
+                target_port: target,
+                expires_at: now() + 60,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(e.apply(&cfg).await.is_empty());
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_recv_buffer_size(4096).unwrap();
+        let mut client = socket
+            .connect(("127.0.0.1".parse::<std::net::IpAddr>().unwrap(), port).into())
+            .await
+            .unwrap();
+        client.write_all(b"request").await.unwrap();
+        client.shutdown().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+        counts(&e, "slow", 1, 0).await;
+        let mut response = vec![];
+        tokio::time::timeout(Duration::from_secs(10), client.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response, vec![0x53; size]);
+        sender.await.unwrap();
+        counts(&e, "slow", 0, 0).await;
+        e.close().await;
+        drop(e);
+        drop(j);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}

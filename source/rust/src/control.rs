@@ -162,6 +162,7 @@ pub async fn dispatch(a: &App, c: Value) -> Result<Value> {
                     v["errors"] = Value::Null;
                     if let Some(p) = v["probe"].as_object_mut() {
                         p.remove("target_checks");
+                        p.remove("rule_connections");
                     }
                     v
                 })

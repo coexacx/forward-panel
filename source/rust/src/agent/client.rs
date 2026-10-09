@@ -54,8 +54,8 @@ fn capacity() -> (usize, usize) {
         .find(|l| l.starts_with("MemTotal:"))
         .and_then(|l| l.split_whitespace().nth(1)?.parse::<usize>().ok())
         .unwrap_or(131072);
-    // Keep default application buffers below 1/8 physical memory, capped for the
-    // hardened 128 MiB service budget. Existing explicit limits remain effective.
+    // Admission is also bounded by the engine's cgroup-aware socket reservations.
+    // These are connection-count ceilings, never a promise to exceed memory capacity.
     let tcp = (mem / 512).clamp(64, 512);
     let udp = (mem / 1024).clamp(64, 256);
     (tcp, udp)
@@ -145,7 +145,18 @@ pub async fn run(path: &Path) -> Result<()> {
                     clear_identity(path, &conf)?;
                     return Ok(());
                 }
-                eprintln!("controller session interrupted; forwarding suspended");
+                let reason = if error.is::<tokio::time::error::Elapsed>() {
+                    "control timeout"
+                } else if error
+                    .downcast_ref::<tokio_tungstenite::tungstenite::Error>()
+                    .is_some()
+                {
+                    "websocket transport"
+                } else {
+                    "protocol or local state"
+                };
+                // Do not log raw errors: they may include authenticated request headers.
+                eprintln!("controller session interrupted ({reason}); forwarding suspended");
             }
         }
         tokio::select! {_=cancel.cancelled()=>break,_=tokio::time::sleep(Duration::from_millis(backoff*1000+(rand::random::<u16>()as u64%500)))=>()}
