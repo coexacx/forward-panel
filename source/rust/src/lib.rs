@@ -89,3 +89,38 @@ pub fn atomic_write(path: &Path, data: &[u8], mode: u32) -> anyhow::Result<()> {
     }
     res
 }
+
+/// IPv4 wildcard covers all local NICs. IPv6 keeps its existing explicit-IP mode.
+pub fn valid_listen_ip(value: &str) -> bool {
+    value.parse::<std::net::IpAddr>().is_ok_and(|ip| {
+        !ip.is_multicast()
+            && (!ip.is_unspecified() || ip.is_ipv4())
+            && !matches!(ip, std::net::IpAddr::V4(v) if v.is_broadcast())
+            && !matches!(ip, std::net::IpAddr::V6(v) if v.to_ipv4_mapped().is_some())
+    })
+}
+pub fn listen_overlap(a: &str, b: &str) -> bool {
+    match (a.parse::<std::net::IpAddr>(), b.parse::<std::net::IpAddr>()) {
+        (Ok(a), Ok(b)) => {
+            let a = a.to_canonical();
+            let b = b.to_canonical();
+            a == b || (a.is_ipv4() == b.is_ipv4() && (a.is_unspecified() || b.is_unspecified()))
+        }
+        _ => true,
+    }
+}
+#[cfg(test)]
+mod listen_tests {
+    use super::*;
+    #[test]
+    fn wildcard_overlaps_all_ipv4_interfaces_but_not_ipv6() {
+        assert!(valid_listen_ip("0.0.0.0"));
+        assert!(!valid_listen_ip("::"));
+        assert!(!valid_listen_ip("224.0.0.1"));
+        assert!(!valid_listen_ip("255.255.255.255"));
+        assert!(listen_overlap("0.0.0.0", "172.10.1.72"));
+        assert!(listen_overlap("103.167.134.7", "0.0.0.0"));
+        assert!(!listen_overlap("103.167.134.7", "172.10.1.72"));
+        assert!(!listen_overlap("0.0.0.0", "::1"));
+    }
+}

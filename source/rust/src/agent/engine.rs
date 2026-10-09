@@ -3,8 +3,9 @@ use super::{
     limits::Gate,
     memory::{Memory, TcpMemory, UDP_BUFFER},
     resolver::Resolver,
+    udp_front::{Front, Route},
 };
-use crate::{now, protocol::*, valid_id, valid_target};
+use crate::{now, protocol::*, valid_id, valid_listen_ip, valid_target};
 use anyhow::{Result, bail};
 use arc_swap::ArcSwap;
 use std::{
@@ -163,10 +164,7 @@ impl Engine {
             .store(now() + c.valid_for_seconds as i64, Ordering::Relaxed);
         let mut wanted = HashMap::new();
         for r in &c.rules {
-            let good_ip = r
-                .listen_ip
-                .parse::<IpAddr>()
-                .is_ok_and(|i| !i.is_unspecified() && !i.is_multicast());
+            let good_ip = valid_listen_ip(&r.listen_ip);
             let targets = r.targets();
             if !good_ip
                 || r.listen_port < 1024
@@ -267,8 +265,8 @@ impl Engine {
         // before any task can read/write it. Bound the pending accept queue.
         socket.bind(addr)?;
         let tcp = socket.listen(16)?;
-        let udp = Arc::new(UdpSocket::bind(addr).await?);
-        tune_udp(&udp)?;
+        let udp = Arc::new(Front::bind(addr).await?);
+        tune_udp(udp.socket())?;
         let active = Arc::new(ArcSwap::from_pointee(Active {
             meter: self.journal.meter(&r.id, &r.cycle_id),
             gate: self.leases.lock().unwrap()[&r.lease_id].clone(),
@@ -573,16 +571,17 @@ async fn udp_loop(
     a: Arc<ArcSwap<Active>>,
     cancel: CancellationToken,
     cursor: Arc<AtomicUsize>,
-    socket: Arc<UdpSocket>,
+    socket: Arc<Front>,
 ) {
-    let mut clients: HashMap<SocketAddr, mpsc::Sender<Packet>> = HashMap::new();
+    let mut clients: HashMap<Route, mpsc::Sender<Packet>> = HashMap::new();
     let mut tasks = JoinSet::new();
     let mut buf = vec![0u8; 65535];
     loop {
         tokio::select! {biased;
          _=cancel.cancelled()=>break,
          Some(_)=tasks.join_next(),if !tasks.is_empty()=>{clients.retain(|_,tx|!tx.is_closed());},
-         result=socket.recv_from(&mut buf)=>{let Ok((n,client))=result else{break};
+         result=socket.recv_from(&mut buf)=>{
+          let (n,client)=match result {Ok(v)=>v,Err(err) if err.kind()==std::io::ErrorKind::InvalidData || err.kind()==std::io::ErrorKind::Interrupted=>continue,Err(_)=>break};
           if clients.get(&client).is_some_and(|tx|tx.is_closed()){clients.remove(&client);}
           if let std::collections::hash_map::Entry::Vacant(entry) = clients.entry(client){
            let Ok(slot)=e.udp.clone().try_acquire_owned()else{continue};
@@ -603,8 +602,8 @@ async fn udp_session(
     e: Arc<Engine>,
     a: Arc<ArcSwap<Active>>,
     cursor: Arc<AtomicUsize>,
-    front: Arc<UdpSocket>,
-    client: SocketAddr,
+    front: Arc<Front>,
+    client: Route,
     mut rx: mpsc::Receiver<Packet>,
 ) {
     let gate = a.load().gate.clone();

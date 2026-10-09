@@ -4,7 +4,7 @@ import argparse,base64,hashlib,json,pathlib,shutil,stat,time,zipfile
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives import serialization
 a=argparse.ArgumentParser();a.add_argument('--signing-key',type=pathlib.Path,required=True);a.add_argument('--output',type=pathlib.Path,required=True);a.add_argument('--agent-amd64',type=pathlib.Path,required=True);a.add_argument('--agent-arm64',type=pathlib.Path,required=True);args=a.parse_args()
-root=pathlib.Path(__file__).resolve().parent.parent;version='0.3.5';out=args.output.resolve();keyfile=args.signing_key.resolve()
+root=pathlib.Path(__file__).resolve().parent.parent;version='0.3.6';out=args.output.resolve();keyfile=args.signing_key.resolve()
 if root==out or root in out.parents or root==keyfile or root in keyfile.parents:raise SystemExit('Output and signing key must be outside source')
 if stat.S_IMODE(keyfile.stat().st_mode)&0o077:raise SystemExit('Signing key must be private')
 key=Ed25519PrivateKey.from_private_bytes(keyfile.read_bytes()[:32]);public=base64.b64encode(key.public_key().public_bytes(serialization.Encoding.Raw,serialization.PublicFormat.Raw)).decode()

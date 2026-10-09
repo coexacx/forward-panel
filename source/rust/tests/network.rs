@@ -529,3 +529,116 @@ async fn slow_half_closed_reader_receives_every_byte_without_reset() {
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
+
+#[tokio::test]
+#[ignore = "requires isolated forwarding-node network namespace"]
+async fn wildcard_multinic_preserves_udp_sources_and_live_tcp() {
+    // Run on the forwarding test node in an isolated network namespace; never
+    // bind a public wildcard socket on the development panel host.
+    assert_eq!(std::env::var("VISTART_MULTINIC_TEST").as_deref(), Ok("1"));
+    let ips: Vec<std::net::Ipv4Addr> = std::env::var("VISTART_MULTINIC_IPS")
+        .unwrap_or_else(|_| "127.0.0.1,127.0.0.2".into())
+        .split(',')
+        .map(|s| s.parse().unwrap())
+        .collect();
+    assert_eq!(ips.len(), 2);
+    let dir = std::env::temp_dir().join(format!("forward-multinic-{}", id()));
+    std::fs::create_dir(&dir).unwrap();
+    let j = Journal::open(&dir.join("traffic.json")).unwrap();
+    let e = Engine::new(
+        j.clone(),
+        Arc::new(Resolver::new(vec!["127.0.0.0/8".parse().unwrap()], vec![])),
+        16,
+        16,
+    );
+    let target = echo().await;
+    let tmp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = tmp.local_addr().unwrap().port();
+    drop(tmp);
+    let rule = Rule {
+        id: id(),
+        user_id: id(),
+        lease_id: id(),
+        cycle_id: id(),
+        listen_ip: "0.0.0.0".into(),
+        listen_port: port,
+        target_host: "127.0.0.1".into(),
+        target_port: target,
+        expires_at: now() + 300,
+        ..Default::default()
+    };
+    let mut config = Config {
+        version: 1,
+        revision: 1,
+        valid_for_seconds: 30,
+        rules: vec![rule.clone()],
+        ..Default::default()
+    };
+    assert!(e.apply(&config).await.is_empty());
+    let mut streams = vec![];
+    for ip in &ips {
+        let mut c = TcpStream::connect((*ip, port)).await.unwrap();
+        c.write_all(b"two-nics").await.unwrap();
+        let mut out = [0u8; 8];
+        c.read_exact(&mut out).await.unwrap();
+        assert_eq!(&out, b"two-nics");
+        streams.push(c);
+    }
+    // Same client IP:port to both local NICs must remain independent flows.
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    for _ in 0..32 {
+        for ip in &ips {
+            udp.send_to(&ip.octets(), (*ip, port)).await.unwrap();
+            let mut out = [0u8; 32];
+            let (n, from) = tokio::time::timeout(Duration::from_secs(2), udp.recv_from(&mut out))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&out[..n], &ip.octets());
+            assert_eq!(from, (*ip, port).into());
+        }
+    }
+    // A connected client silently discards replies with the wrong local source.
+    let connected = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    connected.connect((ips[1], port)).await.unwrap();
+    connected.send(b"connected").await.unwrap();
+    let mut buf = [0u8; 32];
+    let n = tokio::time::timeout(Duration::from_secs(2), connected.recv(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buf[..n], b"connected");
+    let counts = e.rule_connections().await;
+    assert_eq!(counts[&rule.id].tcp, 2);
+    assert_eq!(counts[&rule.id].udp, 3);
+    for _ in 0..3 {
+        config.revision += 1;
+        assert!(e.apply(&config).await.is_empty());
+        for c in &mut streams {
+            c.write_all(b"live").await.unwrap();
+            c.read_exact(&mut buf[..4]).await.unwrap();
+            assert_eq!(&buf[..4], b"live");
+        }
+    }
+    let mut clash = rule.clone();
+    clash.id = id();
+    clash.listen_ip = ips[1].to_string();
+    config.rules.push(clash.clone());
+    let errors = e.apply(&config).await;
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].rule_id, clash.id);
+    assert_eq!(errors[0].code, "bind_failed");
+    for c in &mut streams {
+        c.write_all(b"safe").await.unwrap();
+        c.read_exact(&mut buf[..4]).await.unwrap();
+        assert_eq!(&buf[..4], b"safe");
+    }
+
+    let billed = j.meter(&rule.id, &rule.cycle_id).counter();
+    assert_eq!(billed.up, 313);
+    assert_eq!(billed.down, 313);
+    e.close().await;
+    drop(e);
+    drop(j);
+    std::fs::remove_dir_all(dir).unwrap();
+}

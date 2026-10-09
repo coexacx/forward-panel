@@ -233,10 +233,16 @@ impl Jobs {
             .context("无法识别转发网卡")?;
         let route: Value = serde_json::from_str(&route)?;
         let iface = s(&route[0], "dev");
-        let bind = s(&route[0], "prefsrc");
-        if !bind.parse::<IpAddr>().is_ok_and(|i| !i.is_unspecified()) || iface.is_empty() {
+        let route_ip = s(&route[0], "prefsrc");
+        if !route_ip
+            .parse::<IpAddr>()
+            .is_ok_and(|i| !i.is_unspecified())
+            || iface.is_empty()
+        {
             bail!("无法识别转发网卡地址")
         }
+        // The routing interface is for telemetry, never the ingress listening scope.
+        let bind = "0.0.0.0";
         let prior=remote(&client,req,"if [ -f /var/lib/vistart-agent/config.json ]; then cat /var/lib/vistart-agent/config.json; else printf '{}'; fi",b"").await?;
         let prior: Value =
             serde_json::from_str(&prior).context("已有 Agent 配置无效，请先检查服务器")?;
@@ -308,7 +314,7 @@ impl Jobs {
         remote(&client, req, &install, b"")
             .await
             .context("Agent 服务启动失败")?;
-        let result = json!({"node_id":req["node_id"],"os":lines[0],"arch":arch,"bind_ip":bind,"interface":iface,"fingerprint":fingerprint,"sha256":digest});
+        let result = json!({"node_id":req["node_id"],"os":lines[0],"arch":arch,"bind_ip":bind,"route_ip":route_ip,"listen_mode":"all_ipv4","interface":iface,"fingerprint":fingerprint,"sha256":digest});
         for _ in 0..30 {
             let mut db = store.pool.acquire().await?;
             let rows = crate::store::rows(
@@ -335,6 +341,28 @@ impl Jobs {
                     .unwrap_or(json!({}));
                 let old_bind = s(&meta, "bind_ip").to_owned();
                 if !old_bind.is_empty() && old_bind != bind {
+                    let allocated=crate::store::rows(&mut tx,"SELECT bind_ip,port FROM vp_allocations WHERE node_id=? AND released=0 FOR UPDATE",&[req["node_id"].clone()]).await?;
+                    for (at, a) in allocated.iter().enumerate() {
+                        let effective = if s(a, "bind_ip") == old_bind {
+                            bind
+                        } else {
+                            s(a, "bind_ip")
+                        };
+                        for b in &allocated[at + 1..] {
+                            let other = if s(b, "bind_ip") == old_bind {
+                                bind
+                            } else {
+                                s(b, "bind_ip")
+                            };
+                            if n(a, "port") == n(b, "port")
+                                && crate::listen_overlap(effective, other)
+                            {
+                                bail!(
+                                    "多个本机地址正在复用同一端口，请先调整重复端口后再启用多网卡监听"
+                                );
+                            }
+                        }
+                    }
                     crate::store::exec(
                         &mut tx,
                         "UPDATE vp_pools SET bind_ip=? WHERE node_id=? AND bind_ip=?",

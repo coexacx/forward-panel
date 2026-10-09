@@ -422,10 +422,13 @@ impl Store {
                 let start = n(p, "start");
                 let end = n(p, "end");
                 for k in ["public_ip", "bind_ip"] {
-                    if !s(p, k)
-                        .parse::<std::net::IpAddr>()
-                        .is_ok_and(|ip| !ip.is_unspecified() && !ip.is_multicast())
-                    {
+                    if !(if k == "bind_ip" {
+                        crate::valid_listen_ip(s(p, k))
+                    } else {
+                        s(p, k)
+                            .parse::<std::net::IpAddr>()
+                            .is_ok_and(|ip| !ip.is_unspecified() && !ip.is_multicast())
+                    }) {
                         return Err(invalid());
                     }
                 }
@@ -439,7 +442,14 @@ impl Store {
                         &[p["node_id"].clone()],
                     )
                     .await?;
-                    if count(db,"SELECT COUNT(*) AS n FROM vp_pools WHERE node_id=? AND (public_ip=? OR bind_ip=?) AND start_port<=? AND end_port>=?",&[p["node_id"].clone(),p["public_ip"].clone(),p["bind_ip"].clone(),json!(end),json!(start)]).await?>0{return Err(conflict())}
+                    let overlapping = rows(db,"SELECT public_ip,bind_ip FROM vp_pools WHERE node_id=? AND start_port<=? AND end_port>=?",
+                        &[p["node_id"].clone(),json!(end),json!(start)]).await?;
+                    if overlapping.iter().any(|old| {
+                        old["public_ip"] == p["public_ip"]
+                            || crate::listen_overlap(s(old, "bind_ip"), s(p, "bind_ip"))
+                    }) {
+                        return Err(conflict());
+                    }
                     exec(
                         db,
                         "INSERT INTO vp_pools VALUES(?,?,?,?,?)",
@@ -653,7 +663,10 @@ impl Store {
                             .map(move |port| (s(p, "bind_ip").to_owned(), port))
                     })
                     .filter(|(ip, p)| {
-                        (port == 0 || port == *p) && !used.contains(&(ip.clone(), *p))
+                        (port == 0 || port == *p)
+                            && !used.iter().any(|(other, used_port)| {
+                                used_port == p && crate::listen_overlap(ip, other)
+                            })
                     })
                     .choose(&mut rand::rngs::OsRng)
                     .ok_or_else(conflict)?;

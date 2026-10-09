@@ -184,7 +184,9 @@ pub(super) async fn migrate(db: &mut MySqlConnection, c: &Value) -> Result<Value
                 for port in n(p, "start_port")..=n(p, "end_port") {
                     if (same && port != n(a, "port"))
                         || occupied.contains(&port)
-                        || taken.contains(&(s(p, "bind_ip").into(), port))
+                        || taken.iter().any(|(ip, used_port)| {
+                            *used_port == port && crate::listen_overlap(ip, s(p, "bind_ip"))
+                        })
                     {
                         continue;
                     }

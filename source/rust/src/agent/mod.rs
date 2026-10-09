@@ -5,3 +5,5 @@ pub mod limits;
 pub mod memory;
 pub mod probe;
 pub mod resolver;
+
+mod udp_front;
