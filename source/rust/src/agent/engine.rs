@@ -14,7 +14,7 @@ use std::{
     os::fd::{AsRawFd, RawFd},
     sync::{
         Arc,
-        atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -500,11 +500,12 @@ async fn stream(
     // futures and the watcher have been dropped; no watcher is spawned.
     let client_fd = client.as_raw_fd();
     let remote_fd = remote.as_raw_fd();
+    let activity = StreamActivity::new();
     let copied = async {
         let (cr, cw) = client.split();
         let (rr, rw) = remote.split();
-        let up = pump(cr, rw, a.clone(), true);
-        let down = pump(rr, cw, a, false);
+        let up = pump(cr, rw, a.clone(), true, &activity);
+        let down = pump(rr, cw, a, false, &activity);
         tokio::pin!(up, down);
         // Full-duplex traffic has no additional polling. After the first EOF,
         // the completed read half no longer observes a later RST, while the
@@ -646,16 +647,72 @@ fn tcp_state(fd: RawFd) -> std::io::Result<u8> {
     Ok(info.tcpi_state)
 }
 
+// A TCP stream is idle only when neither direction makes progress. Keep the
+// existing read deadline, but let traffic in either direction extend it.
+struct StreamActivity {
+    epoch: Instant,
+    last_ms: AtomicU64,
+}
+impl StreamActivity {
+    fn new() -> Self {
+        Self {
+            epoch: Instant::now(),
+            last_ms: AtomicU64::new(0),
+        }
+    }
+    fn tick(&self) -> u64 {
+        self.epoch.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+    }
+    fn touch(&self) {
+        // Concurrent pumps must never move the shared timestamp backwards.
+        self.last_ms.fetch_max(self.tick(), Ordering::Relaxed);
+    }
+    fn idle_for(&self) -> Duration {
+        Duration::from_millis(
+            self.tick()
+                .saturating_sub(self.last_ms.load(Ordering::Relaxed)),
+        )
+    }
+    async fn read<R: tokio::io::AsyncRead + Unpin>(
+        &self,
+        src: &mut R,
+        buf: &mut [u8],
+        idle: Duration,
+    ) -> std::io::Result<usize> {
+        loop {
+            let remaining = idle.saturating_sub(self.idle_for());
+            match tokio::time::timeout(remaining, src.read(buf)).await {
+                Ok(result) => {
+                    let n = result?;
+                    if n > 0 {
+                        self.touch();
+                    }
+                    return Ok(n);
+                }
+                Err(_) if self.idle_for() < idle => continue,
+                Err(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "both TCP directions are idle",
+                    ));
+                }
+            }
+        }
+    }
+}
 async fn pump<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin>(
     mut src: R,
     mut dst: W,
     a: Arc<ArcSwap<Active>>,
     up: bool,
+    activity: &StreamActivity,
 ) -> Result<()> {
     let mut buf = vec![0u8; 32768];
     let gate = a.load().gate.clone();
     loop {
-        let n = tokio::time::timeout(Duration::from_secs(300), src.read(&mut buf)).await??;
+        let n = activity
+            .read(&mut src, &mut buf, Duration::from_secs(300))
+            .await?;
         if n == 0 {
             dst.shutdown().await?;
             return Ok(());
@@ -674,6 +731,7 @@ async fn pump<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin>
             if m == 0 {
                 bail!("write zero")
             }
+            activity.touch();
             a.load().meter.add(m, up);
             at += m;
         }
@@ -762,5 +820,42 @@ async fn udp_session(
          r=backend.recv(&mut buf)=>{let Ok(n)=r else{break};last=Instant::now();if !gate.packet(n){continue;}
          if let Ok(Ok(w))=tokio::time::timeout(Duration::from_secs(3),front.send_to(&buf[..n],client)).await{a.load().meter.add(w,false);last=Instant::now();}else{break}}
         }
+    }
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+    #[tokio::test]
+    async fn one_direction_keeps_other_read_alive_and_true_idle_expires() {
+        let activity = Arc::new(StreamActivity::new());
+        let idle = Duration::from_millis(500);
+        let (_quiet_writer, mut quiet_reader) = tokio::io::duplex(16);
+        let watcher = activity.clone();
+        let quiet =
+            tokio::spawn(async move { watcher.read(&mut quiet_reader, &mut [0u8; 1], idle).await });
+        let (mut busy_writer, mut busy_reader) = tokio::io::duplex(16);
+        for value in 0u8..12 {
+            busy_writer.write_all(&[value]).await.unwrap();
+            let mut byte = [0u8; 1];
+            assert_eq!(
+                activity
+                    .read(&mut busy_reader, &mut byte, idle)
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(byte[0], value);
+            assert!(
+                !quiet.is_finished(),
+                "active reverse traffic must extend the idle deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let result = tokio::time::timeout(Duration::from_secs(2), quiet)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
     }
 }

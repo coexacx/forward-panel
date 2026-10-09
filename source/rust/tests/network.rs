@@ -1197,3 +1197,120 @@ async fn one_sided_eof_then_reset_releases_while_other_peer_stays_open() {
     drop(journal);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test]
+#[ignore = "six-minute directional-stream soak; run explicitly on the forwarding test node"]
+async fn continuous_upload_and_download_survive_five_minute_reverse_silence() {
+    async fn send(mut peer: TcpStream) {
+        for sequence in 0u32..67 {
+            if sequence > 0 {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            peer.write_all(&sequence.to_be_bytes()).await.unwrap();
+        }
+        peer.shutdown().await.unwrap();
+        let mut rest = Vec::new();
+        peer.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty());
+    }
+    async fn receive(mut peer: TcpStream) {
+        for sequence in 0u32..67 {
+            let mut bytes = [0u8; 4];
+            tokio::time::timeout(Duration::from_secs(12), peer.read_exact(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(u32::from_be_bytes(bytes), sequence);
+        }
+        let mut byte = [0u8; 1];
+        assert_eq!(peer.read(&mut byte).await.unwrap(), 0);
+        peer.shutdown().await.unwrap();
+    }
+    let dir = std::env::temp_dir().join(format!("forward-directional-soak-{}", id()));
+    std::fs::create_dir(&dir).unwrap();
+    let journal = Journal::open(&dir.join("traffic.json")).unwrap();
+    let engine = Engine::new(
+        journal.clone(),
+        Arc::new(Resolver::new(vec!["127.0.0.0/8".parse().unwrap()], vec![])),
+        2,
+        2,
+    );
+    let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_port = backend.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let mut jobs = tokio::task::JoinSet::new();
+        let mut completed = 0;
+        loop {
+            tokio::select! {
+                Some(result) = jobs.join_next(), if !jobs.is_empty() => {
+                    result.unwrap();
+                    completed += 1;
+                    if completed == 2 { break; }
+                },
+                accepted = backend.accept() => {
+                    let (mut peer, _) = accepted.unwrap();
+                    let mut mode = [0u8; 1];
+                    if peer.read(&mut mode).await.unwrap_or(0) == 0 { continue; }
+                    jobs.spawn(async move {
+                        if mode[0] == b'U' { receive(peer).await; }
+                        else { assert_eq!(mode[0], b'D'); send(peer).await; }
+                    });
+                }
+            }
+        }
+    });
+    let temporary = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = temporary.local_addr().unwrap().port();
+    drop(temporary);
+    let config = Config {
+        version: 1,
+        revision: 1,
+        valid_for_seconds: 30,
+        rules: vec![Rule {
+            id: "one-way".into(),
+            lease_id: "lease".into(),
+            cycle_id: "cycle".into(),
+            listen_ip: "127.0.0.1".into(),
+            listen_port: port,
+            target_host: "127.0.0.1".into(),
+            target_port,
+            expires_at: now() + 600,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    assert!(engine.apply(&config).await.is_empty());
+    let refreshing = engine.clone();
+    let refresh = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            assert!(refreshing.apply(&config).await.is_empty());
+        }
+    });
+    let mut upload = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    upload.write_all(b"U").await.unwrap();
+    let mut download = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    download.write_all(b"D").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(355), async {
+        tokio::join!(send(upload), receive(download));
+        server.await.unwrap();
+    })
+    .await
+    .unwrap();
+    counts(&engine, "one-way", 0, 0).await;
+    assert!(
+        engine
+            .lease_usage()
+            .iter()
+            .all(|u| u.tcp_active == 0 && u.tcp_waiting == 0)
+    );
+    let traffic = journal.meter("one-way", "cycle").counter();
+    assert_eq!(traffic.up, 67 * 4 + 2);
+    assert_eq!(traffic.down, 67 * 4);
+    refresh.abort();
+    let _ = refresh.await;
+    engine.close().await;
+    drop(engine);
+    drop(journal);
+    std::fs::remove_dir_all(dir).unwrap();
+}

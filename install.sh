@@ -3,8 +3,8 @@ set +x
 set -Eeuo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 umask 077
-readonly FORWARD_VERSION=0.3.7
-readonly FORWARD_RELEASE_BASE=https://github.com/coexacx/forward-panel/releases/download/v0.3.7
+readonly FORWARD_VERSION=0.3.8
+readonly FORWARD_RELEASE_BASE=https://github.com/coexacx/forward-panel/releases/download/v0.3.8
 readonly FORWARD_PUBLIC_KEY=KIIxr0QlDRHjO6RTCGNmUJ3tYlbbun2wWTYmaMctbOI= # Public Ed25519 verification key; gitleaks:allow
 forward_work='' forward_name='' forward_port=19280 forward_cache='' forward_check=0
 die(){ printf '\n  %s\n\n' "$*" >&2; exit 1; }
