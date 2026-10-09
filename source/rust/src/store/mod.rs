@@ -162,6 +162,24 @@ async fn bump(db: &mut MySqlConnection) -> Result<()> {
     .await?;
     Ok(())
 }
+async fn lease_dispatch_barrier(db: &mut MySqlConnection, lease_id: &str) -> Result<()> {
+    let rev = one(
+        db,
+        "SELECT value FROM vp_meta WHERE meta_key='revision'",
+        &[],
+    )
+    .await?;
+    exec(
+        db,
+        "INSERT INTO vp_metadata(id,value) VALUES(?,?) ON DUPLICATE KEY UPDATE value=VALUES(value)",
+        &[
+            json!(format!("lease_apply_{lease_id}")),
+            json!({"revision": n(&rev,"value")}),
+        ],
+    )
+    .await?;
+    Ok(())
+}
 async fn audit(db: &mut MySqlConnection, event: &str, subject: &str, detail: &str) -> Result<()> {
     exec(
         db,
@@ -171,6 +189,7 @@ async fn audit(db: &mut MySqlConnection, event: &str, subject: &str, detail: &st
     .await?;
     Ok(())
 }
+pub const MAX_USAGE_BYTES: i64 = 9_007_199_254_740_991;
 const PLAN: &str = "SELECT id,name,port_limit,traffic_limit AS traffic_limit_bytes,period_days,price_cents,reset_price_cents,node_ids,enabled,deleted,bandwidth_mbps,tcp_limit,udp_limit FROM vp_plans";
 const LEASE: &str = "SELECT l.id,l.user_id,l.plan_id,l.plan_name,l.port_limit,l.traffic_limit AS traffic_limit_bytes,l.period_days,l.node_ids,l.expires_at,l.next_reset_at,l.current_cycle AS cycle_id,l.manual_paused,l.ended,l.deleted,l.bandwidth_mbps,l.tcp_limit,l.udp_limit,c.up AS used_up,c.down AS used_down,(SELECT COUNT(*) FROM vp_allocations a WHERE a.lease_id=l.id AND a.released=0) AS used_ports FROM vp_leases l JOIN vp_cycles c ON c.id=l.current_cycle";
 const ALLOCATION: &str = "SELECT a.id,a.lease_id,a.node_id,a.public_ip,a.bind_ip,a.port,a.target_host,a.target_port,a.released,COALESCE(t.targets,'[]') AS targets FROM vp_allocations a LEFT JOIN vp_allocation_targets t ON t.rule_id=a.id";
@@ -342,6 +361,7 @@ impl Store {
             "delete-plan" => return lifecycle::delete_plan(db, c).await,
             "delete-lease" | "admin-delete-lease" => return lifecycle::delete_lease(db, c).await,
             "edit-node" => return lifecycle::edit_node(db, c).await,
+            "adjust-lease-usage" => return lifecycle::adjust_usage(db, c).await,
             "user" => {
                 let v = &c["user"];
                 if !valid_id(s(v, "id")) || !name_ok(s(v, "name")) {
@@ -584,6 +604,9 @@ impl Store {
                     }
                 }
                 bump(db).await?;
+                if s(c, "action") == "pause" && b(&l, "manual_paused") != b(c, "paused") {
+                    lease_dispatch_barrier(db, lid).await?;
+                }
             }
             "claim" => {
                 let v = &c["claim"];

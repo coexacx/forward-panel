@@ -100,11 +100,11 @@ pub async fn snapshot(ctx: &Context<'_>, admin: bool) -> Result<Value> {
             expires_at: n(lease, "expires_at"),
             limits: serde_json::from_value(lease.clone()).unwrap_or_default(),
         };
-        let pending = if let Some(applied) = node["applied_rules"].as_object() {
-            applied.get(s(a, "id")).and_then(Value::as_str) != Some(expected.fingerprint().as_str())
-        } else {
-            b(node, "syncing")
-        };
+        let barrier = meta
+            .get(&format!("lease_apply_{}", s(a, "lease_id")))
+            .map(|v| n(v, "revision"))
+            .unwrap_or(0);
+        let pending = configuration_pending(node, s(a, "id"), &expected.fingerprint(), barrier);
         let apply_status = if b(a, "released")
             || lease == &empty
             || b(lease, "ended")
@@ -301,6 +301,15 @@ pub async fn snapshot(ctx: &Context<'_>, admin: bool) -> Result<Value> {
     Ok(state)
 }
 
+fn configuration_pending(node: &Value, rule_id: &str, fingerprint: &str, barrier: i64) -> bool {
+    let mismatched = if let Some(applied) = node["applied_rules"].as_object() {
+        applied.get(rule_id).and_then(Value::as_str) != Some(fingerprint)
+    } else {
+        b(node, "syncing")
+    };
+    mismatched || n(node, "applied_revision") < barrier
+}
+
 fn rule_connections(node: &Value, id: &str, reported: Option<&Value>) -> Value {
     let mut out =
         json!({"tcp":null,"udp":null,"status":"unknown","updated_at":n(node,"last_seen")});
@@ -329,6 +338,22 @@ fn rule_connections(node: &Value, id: &str, reported: Option<&Value>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn resumed_rule_waits_for_fresh_ack_without_requeuing_unrelated_rules() {
+        let mut node =
+            json!({"applied_revision":12,"syncing":true,"applied_rules":{"a":"hash","b":"other"}});
+        assert!(configuration_pending(&node, "a", "hash", 13));
+        assert!(!configuration_pending(&node, "b", "other", 0));
+        node["applied_revision"] = json!(13);
+        assert!(!configuration_pending(&node, "a", "hash", 13));
+        assert!(configuration_pending(&node, "a", "changed-target", 13));
+        assert!(configuration_pending(
+            &json!({"syncing":true}),
+            "a",
+            "hash",
+            0
+        ));
+    }
     #[test]
     fn connection_display_distinguishes_zero_unknown_and_offline() {
         let mut node = json!({"online":true,"last_seen":123,"active_rules":["a"]});

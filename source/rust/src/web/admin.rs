@@ -422,8 +422,19 @@ pub async fn dispatch(ctx: &mut Context<'_>, route: &str, v: &Value) -> Result<V
         "admin/lease" => {
             let id = ident(v, "id")?;
             let action = text(v, "action", 30, true)?;
-            if !["pause", "resume", "end", "expiry"].contains(&action.as_str()) {
+            if !["pause", "resume", "end", "expiry", "usage"].contains(&action.as_str()) {
                 return Err(fail(400, "操作不正确"));
+            }
+            if action == "usage" {
+                return ctx
+                    .app
+                    .store
+                    .command(json!({
+                        "action":"adjust-lease-usage","actor_id":user["id"],"lease_id":id,
+                        "expected_cycle":ident(v,"expected_cycle")?,
+                        "used_bytes":integer(v,"used_bytes",0,crate::store::MAX_USAGE_BYTES)?
+                    }))
+                    .await;
             }
             let l = ctx
                 .app

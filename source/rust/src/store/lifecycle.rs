@@ -89,6 +89,12 @@ pub(super) async fn delete_lease(db: &mut MySqlConnection, c: &Value) -> Result<
         &[l["id"].clone()],
     )
     .await?;
+    exec(
+        db,
+        "DELETE FROM vp_metadata WHERE id=?",
+        &[json!(format!("lease_apply_{}", s(&l, "id")))],
+    )
+    .await?;
     // Keep small accounting records so in-flight/replayed counters remain idempotent.
     // A delayed paid renewal/reset is recorded as paid_review, never reactivated.
     bump(db).await?;
@@ -354,4 +360,93 @@ pub(super) async fn edit_node(db: &mut MySqlConnection, c: &Value) -> Result<Val
     .await?;
     bump(db).await?;
     Ok(json!({"ok":true}))
+}
+
+/// Adjust this billing cycle's aggregate; cumulative Agent cursors stay intact.
+pub(super) async fn adjust_usage(db: &mut MySqlConnection, c: &Value) -> Result<Value> {
+    administrator(db, c).await?;
+    let total = c["used_bytes"]
+        .as_i64()
+        .filter(|n| (0..=MAX_USAGE_BYTES).contains(n))
+        .ok_or_else(invalid)?;
+    if !valid_id(s(c, "lease_id")) || !valid_id(s(c, "expected_cycle")) {
+        return Err(invalid());
+    }
+    // Store::command serializes this transaction with reports and natural resets.
+    // Row locks also protect against a second process writing the same cycle.
+    let l = one(
+        db,
+        &format!("{LEASE} WHERE l.id=? FOR UPDATE"),
+        &[c["lease_id"].clone()],
+    )
+    .await?;
+    if b(&l, "deleted") {
+        return Err(missing());
+    }
+    if b(&l, "ended") || n(&l, "expires_at") <= now() {
+        return Err(Fault {
+            code: 409,
+            message: "套餐已结束或到期，不能调整已用流量",
+        }
+        .into());
+    }
+    if l["cycle_id"] != c["expected_cycle"] || n(&l, "next_reset_at") <= now() {
+        return Err(Fault {
+            code: 409,
+            message: "流量周期已变化，请刷新套餐后重试",
+        }
+        .into());
+    }
+    let old_up = n(&l, "used_up");
+    let old_down = n(&l, "used_down");
+    let old_total = old_up + old_down;
+    // Preserve the existing accounting split without floating point rounding.
+    let up = if old_total > 0 {
+        ((total as i128 * old_up as i128) / old_total as i128) as i64
+    } else {
+        0
+    };
+    let down = total - up;
+    exec(
+        db,
+        "UPDATE vp_cycles SET up=?,down=? WHERE id=?",
+        &[json!(up), json!(down), l["cycle_id"].clone()],
+    )
+    .await?;
+    bump(db).await?;
+    let limit = n(&l, "traffic_limit_bytes");
+    if limit > 0 && (old_total >= limit) != (total >= limit) {
+        lease_dispatch_barrier(db, s(&l, "id")).await?;
+    }
+    audit(
+        db,
+        "usage_adjusted",
+        s(&l, "id"),
+        &json!({
+            "actor_id":c["actor_id"],"cycle_id":l["cycle_id"],
+            "before_up":old_up,"before_down":old_down,"after_up":up,"after_down":down
+        })
+        .to_string(),
+    )
+    .await?;
+    // The visible audit event commits atomically with the adjustment.
+    exec(
+        db,
+        "INSERT INTO vp_web_audit(at,actor,subject,action,detail) VALUES(?,?,?,?,?)",
+        &[
+            json!(now()),
+            c["actor_id"].clone(),
+            l["user_id"].clone(),
+            json!("修改已用流量"),
+            json!(format!(
+                "套餐 {}：{} B → {} B；周期 {}",
+                s(&l, "id"),
+                old_total,
+                total,
+                s(&l, "cycle_id")
+            )),
+        ],
+    )
+    .await?;
+    Ok(json!({"ok":true,"before_used_bytes":old_total,"used_bytes":total,"cycle_id":l["cycle_id"]}))
 }

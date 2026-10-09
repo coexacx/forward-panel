@@ -2801,42 +2801,49 @@ function App() {
         submit("admin/grant"),
         "开通套餐",
       );
-    if (popup.kind === "lease")
+    if (popup.kind === "lease") {
+      const action = item.lease_action ?? (item.manual_paused ? "resume" : "pause");
       return form(
         "管理用户套餐",
         <>
-          <p>
-            {accountName(item.user_id)} · {item.plan_name}
-          </p>
-          <Select label="操作" name="action">
+          <p>{accountName(item.user_id)} · {item.plan_name}</p>
+          <Select label="操作" name="action" value={action}
+            onChange={(e) => setPopup({ ...popup, item: { ...item, lease_action: e.target.value } })}>
             <option value={item.manual_paused ? "resume" : "pause"}>
               {item.manual_paused ? "恢复使用" : "暂停全部节点转发"}
             </option>
+            <option value="usage" disabled={item.ended || item.expires_at <= Date.now() / 1000}>修改已用流量</option>
             <option value="expiry">调整到期时间</option>
             <option value="end">结束套餐并回收端口</option>
           </Select>
-          <Field
-            label="新的到期时间（选择调整到期时生效）"
-            name="date"
-            type="datetime-local"
-            defaultValue={new Date(
-              item.expires_at * 1000 - new Date().getTimezoneOffset() * 60000,
-            )
-              .toISOString()
-              .slice(0, 16)}
-          />
-          <p className="hint">
-            到期时间调整不会清除已用流量或改变自然重置日。结束套餐会关闭其全部转发。
-          </p>
+          {action === "usage" && <>
+            <p className="hint">当前已用 {bytes(item.used_up + item.used_down)}，套餐额度 {item.traffic_limit_bytes ? bytes(item.traffic_limit_bytes) : "不限量"}。</p>
+            <div className="form-grid">
+              <Field label="新的已用流量" name="usage_amount" type="number" min="0" max="9007199254740991" step="any" required placeholder="填写新的计量值" />
+              <Select label="单位" name="usage_unit" defaultValue="1000000000">
+                <option value="1">B</option>
+                <option value="1000000">MB</option>
+                <option value="1000000000">GB</option>
+                <option value="1000000000000">TB</option>
+              </Select>
+            </div>
+            <p className="hint">保存后从新数值继续累计。达到额度时暂停，调低后恢复符合条件的转发；到期日和自然重置日不变。</p>
+          </>}
+          {action === "expiry" && <>
+            <Field label="新的到期时间" name="date" type="datetime-local" required
+              defaultValue={new Date(item.expires_at * 1000 - new Date().getTimezoneOffset() * 60000).toISOString().slice(0, 16)} />
+            <p className="hint">到期时间调整不会清除已用流量或改变自然重置日。</p>
+          </>}
+          {action === "end" && <p className="hint">结束套餐会关闭其全部转发并回收端口。</p>}
         </>,
         submit("admin/lease", (v) => ({
           id: item.id,
           action: v.action,
-          ...(v.action === "expiry"
-            ? { expires: Math.floor(new Date(v.date).getTime() / 1000) }
-            : {}),
+          ...(v.action === "expiry" ? { expires: Math.floor(new Date(v.date).getTime() / 1000) } : {}),
+          ...(v.action === "usage" ? { used_bytes: Math.round(Number(v.usage_amount) * Number(v.usage_unit)), expected_cycle: item.cycle_id } : {}),
         })),
       );
+    }
     if (popup.kind === "user")
       return form(
         item.id ? "管理用户" : "创建用户",
