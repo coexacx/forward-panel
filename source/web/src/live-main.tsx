@@ -114,8 +114,9 @@ const forwardingLabel = (a: Any) => ({
   apply_failed: "监听失败",
   not_listening: "未监听",
   unconfigured: "待配置目标",
+  agent_upgrade_required: "需升级 Agent",
 } as Any)[a.apply_status] ?? "等待确认";
-const forwardingWarn = (a: Any) => ["apply_failed", "not_listening"].includes(a.apply_status);
+const forwardingWarn = (a: Any) => ["apply_failed", "not_listening", "agent_upgrade_required"].includes(a.apply_status);
 const orderLabel: Any = {
   pending: "待付款",
   paid: "已支付",
@@ -280,7 +281,7 @@ function Modal({
     const before = document.activeElement as HTMLElement;
     const timer = setTimeout(
       () =>
-        ref.current?.querySelector<HTMLElement>("input,select,button")?.focus(),
+        ref.current?.querySelector<HTMLElement>("[data-autofocus],input,select,button")?.focus(),
       20,
     );
     function key(e: KeyboardEvent) {
@@ -1223,6 +1224,8 @@ function App() {
                   />
                 </div>
                 <dl className="details">
+                  <div><dt>跨节点总带宽</dt><dd>{l.bandwidth_mbps ? l.bandwidth_mbps+" Mbps" : "不限"}<small>上行 + 下行</small></dd></div>
+                  <div><dt>TCP / UDP 上限</dt><dd>{l.tcp_limit || "不限"} / {l.udp_limit || "不限"}</dd></div>
                   <div>
                     <dt>下次自然重置</dt>
                     <dd>{date(l.next_reset_at)}</dd>
@@ -1321,6 +1324,8 @@ function App() {
                     <Check size={15} />
                     {p.node_ids.length} 台可用节点
                   </li>
+                  <li><Check size={15} />{p.bandwidth_mbps ? p.bandwidth_mbps+" Mbps 总带宽" : "不限带宽"}</li>
+                  <li><Check size={15} />TCP {p.tcp_limit || "不限"} · UDP {p.udp_limit || "不限"}</li>
                   <li>
                     <Check size={15} />
                     单次流量重置 {money(p.reset_price_cents)}
@@ -2532,6 +2537,61 @@ function App() {
         {admin && <Field label="输入套餐名称确认" name="confirm_name" required autoComplete="off" />}
       </>, submit(admin ? "admin/delete-lease" : "delete-lease",
         (v) => ({ ...v, id: item.id }), "套餐已删除，端口已释放"), "确认删除");
+    if (popup.kind === "plan-preview") {
+      const p=item.preview, request=item.request;
+      const value=(key:string,v:any):string=>key==="node_ids"?(v??[]).map(nodeName).join("、"):
+        key==="traffic_limit_bytes"?(v?bytes(v):"不限"):
+        key==="bandwidth_mbps"?(v?v+" Mbps":"不限"):
+        key==="period_days"?v+" 天":(["tcp_limit","udp_limit"].includes(key)?(v?String(v):"不限"):String(v??0));
+      const labels:Any={plan_name:"套餐名称",port_limit:"端口数",traffic_limit_bytes:"周期流量",
+        period_days:"后续周期",node_ids:"可用节点",bandwidth_mbps:"总带宽",tcp_limit:"TCP 连接",udp_limit:"UDP 会话"};
+      return <Modal title="确认套餐更新影响" onClose={()=>setPopup(null)} busy={busy}>
+        <form key={item.preview_token} className="modal-body impact-preview" onSubmit={e=>{
+          e.preventDefault();run("admin/plan",{...request,preview_token:item.preview_token},"套餐及已有租约已更新").catch(()=>{});
+        }}>
+          <p data-autofocus tabIndex={-1}>将「{p.plan.name}」同步给 {p.users_count} 位用户的 {p.leases_count} 份套餐。</p>
+          <div className="impact-totals">
+            <span>释放转发 <strong>{p.release_count}</strong></span>
+            <span>流量暂停 <strong>{p.pause_count}</strong></span>
+            <span>恢复使用 <strong>{p.resume_count}</strong></span>
+          </div>
+          <p className="hint">已用流量、到期日与自然重置日保留。降低连接数后，超额的新连接会等待或被拒绝，已有连接继续至关闭。</p>
+          {!!p.upgrade_nodes.length && <p className="form-error">
+            {p.upgrade_nodes.map((n:Any)=>n.name).join("、")} 需要升级 Agent 后才能执行套餐限额；升级前，带限额的规则会停止转发。
+          </p>}
+          <div className="impact-leases">
+            {p.leases.map((l:Any)=><details key={l.id} open={l.release_rules.length>0||l.will_pause||l.will_resume}>
+              <summary><strong>{l.user_name} · {l.username || l.user_id.slice(0,8)}</strong>
+                <span>套餐 {l.id.slice(0,8)}{l.release_rules.length>0&&" · 释放 "+l.release_rules.length+" 条"}
+                  {l.will_pause&&" · 流量暂停"}{l.will_resume&&" · 恢复使用"}</span></summary>
+              <dl className="details">
+                {Object.keys(labels).filter(k=>JSON.stringify(l.before[k])!==JSON.stringify(l.after[k])).map(k=>
+                  <div key={k}><dt>{labels[k]}</dt><dd>{value(k,l.before[k])} → {value(k,l.after[k])}</dd></div>)}
+                <div><dt>已用流量</dt><dd>{bytes(l.used_bytes)}</dd></div>
+              </dl>
+              {l.release_rules.length>0&&<div className="table-scroll"><table>
+                <thead><tr><th>将释放的入口</th><th>转发目标</th><th>原因</th></tr></thead>
+                <tbody>{l.release_rules.map((r:Any)=><tr key={r.id}><td>{nodeName(r.node_id)}<small>{endpoint(r.public_ip,r.port)}</small></td>
+                  <td className="mono">{r.target_host?endpoint(r.target_host,r.target_port):"未配置"}</td>
+                  <td>{r.reason==="node_removed"?"节点被移除":"超出端口额度"}</td></tr>)}</tbody>
+              </table></div>}
+            </details>)}
+          </div>
+          {!p.leases_count&&<p className="hint">当前没有可同步的已购套餐，仅更新套餐商品。</p>}
+          <label className="check-line"><input type="checkbox" required name="reviewed" /><span>我已核对以上变更和将释放的转发</span></label>
+          {feedback}
+          <div className="form-footer">
+            <Button type="button" disabled={busy} onClick={()=>open("plan",request)}>返回修改</Button>
+            <Button type="button" disabled={busy} onClick={async()=>{
+              setBusy(true);setFormError("");
+              try {const r=await api("admin/preview-plan",request);open("plan-preview",{...r,request});}
+              catch(e){setFormError((e as Error).message);}finally{setBusy(false);}
+            }}>重新预览</Button>
+            <Button primary danger={p.release_count>0||p.pause_count>0} type="submit" disabled={busy}>确认更新</Button>
+          </div>
+        </form>
+      </Modal>;
+    }
     if (popup.kind === "plan")
       return form(
         item.id ? "编辑套餐" : "添加套餐",
@@ -2594,6 +2654,12 @@ function App() {
             required
             hint="上行 + 下行累计；填 0 表示不限量。"
           />
+          <div className="limit-fields">
+            <Field label="总带宽（Mbps）" name="bandwidth_mbps" type="number" min="0" max="1000000" step="1" defaultValue={item.bandwidth_mbps ?? 0} required />
+            <Field label="TCP 连接上限" name="tcp_limit" type="number" min="0" max="65536" step="1" defaultValue={item.tcp_limit ?? 0} required />
+            <Field label="UDP 会话上限" name="udp_limit" type="number" min="0" max="16384" step="1" defaultValue={item.udp_limit ?? 0} required />
+          </div>
+          <p className="hint">填 0 表示不限。同一份已购套餐的所有节点、端口合计；带宽为上行 + 下行。限额需要 Agent 0.3.2 及以上版本，仍受节点自身安全容量约束。</p>
           <div className="field">
             <span>绑定转发服务器</span>
             <div className="checkbox-grid">
@@ -2620,27 +2686,27 @@ function App() {
             <span>上架此套餐</span>
           </label>
           {item.id && <label className="check-line">
-            <input type="checkbox" name="update_existing" />
+            <input type="checkbox" name="update_existing" defaultChecked={item.update_existing ?? false} />
             <span>强制更新已有用户套餐</span>
           </label>}
           <p className="hint">
-            默认保留已有套餐额度。勾选后同步名称、端口、流量、节点和后续周期，
+            默认保留已有套餐额度。勾选后先预览影响，再同步名称、额度、限额、节点和后续周期，
             保留到期时间、下次重置日与已用流量。
             移除节点及超出新额度的转发会被释放，优先保留较小端口。
           </p>
         </>,
-        submit("admin/plan", (v, f) => ({
-          id: item.id ?? "",
-          name: v.name,
-          port_limit: Number(v.port_limit),
-          period_days: Number(v.period_days),
-          price_cents: Math.round(Number(v.price) * 100),
-          reset_price_cents: Math.round(Number(v.reset_price) * 100),
-          traffic_limit_bytes: Math.round(Number(v.traffic) * 1e9),
-          node_ids: new FormData(f).getAll("node_ids"),
-          enabled: new FormData(f).has("enabled"),
-          update_existing: new FormData(f).has("update_existing"),
-        })),
+        async e => {
+          const f=e.currentTarget,v=formdata(e),fields=new FormData(f);
+          const request={id:item.id??"",name:v.name,port_limit:Number(v.port_limit),
+            period_days:Number(v.period_days),price_cents:Math.round(Number(v.price)*100),
+            reset_price_cents:Math.round(Number(v.reset_price)*100),traffic_limit_bytes:Math.round(Number(v.traffic)*1e9),
+            bandwidth_mbps:Number(v.bandwidth_mbps),tcp_limit:Number(v.tcp_limit),udp_limit:Number(v.udp_limit),
+            node_ids:fields.getAll("node_ids"),enabled:fields.has("enabled"),update_existing:fields.has("update_existing")};
+          if(!request.update_existing){await run("admin/plan",request).catch(()=>{});return;}
+          setBusy(true);setFormError("");
+          try {const r=await api("admin/preview-plan",request);open("plan-preview",{...r,request});}
+          catch(e){setFormError((e as Error).message);}finally{setBusy(false);}
+        },
       );
     if (popup.kind === "claim")
       return (

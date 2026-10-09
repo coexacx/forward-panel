@@ -254,6 +254,7 @@ async fn agent(
 async fn session(a: &App, id: &str, token: &str, mut ws: WebSocket) -> Result<()> {
     let mut next = tokio::time::Instant::now();
     let mut previous: Option<Config> = None;
+    let limit_session = crate::id();
     loop {
         tokio::time::sleep_until(next).await;
         next = tokio::time::Instant::now() + Duration::from_millis(500);
@@ -269,6 +270,9 @@ async fn session(a: &App, id: &str, token: &str, mut ws: WebSocket) -> Result<()
         let r: Report = serde_json::from_str(&raw)?;
         a.store.report(id, &r).await?;
         let mut cfg = a.store.rules(id).await?;
+        a.store
+            .limit_config(id, &limit_session, &r, &mut cfg, previous.as_ref())
+            .await?;
         let urls: Vec<String> =
             serde_json::from_value(a.config.read().await["controller_urls"].clone())?;
         if !urls.is_empty() {

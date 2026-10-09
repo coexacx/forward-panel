@@ -1,5 +1,6 @@
 use super::{
     journal::{Journal, Meter},
+    limits::Gate,
     resolver::Resolver,
 };
 use crate::{now, protocol::*, valid_id, valid_target};
@@ -24,6 +25,7 @@ use tokio_util::sync::CancellationToken;
 struct Active {
     rule: Rule,
     meter: Arc<Meter>,
+    gate: Arc<Gate>,
 }
 struct Forward {
     active: Arc<ArcSwap<Active>>,
@@ -32,6 +34,7 @@ struct Forward {
 }
 pub struct Engine {
     rules: Mutex<HashMap<String, Forward>>,
+    leases: std::sync::Mutex<HashMap<String, Arc<Gate>>>,
     pub journal: Arc<Journal>,
     pub resolver: Arc<Resolver>,
     tcp: Arc<Semaphore>,
@@ -51,6 +54,7 @@ impl Engine {
     ) -> Arc<Self> {
         let e = Arc::new(Self {
             rules: Mutex::new(HashMap::new()),
+            leases: std::sync::Mutex::new(HashMap::new()),
             journal,
             resolver,
             tcp: Arc::new(Semaphore::new(tcp)),
@@ -105,6 +109,7 @@ impl Engine {
             let _ = f.task.await;
         }
         self.checks.lock().await.clear();
+        self.leases.lock().unwrap().clear();
     }
     pub async fn close(&self) {
         self.stop.cancel();
@@ -138,6 +143,8 @@ impl Engine {
                 || !valid_id(&r.id)
                 || !valid_id(&r.cycle_id)
                 || r.expires_at <= now()
+                || !r.limits.valid()
+                || !valid_id(&r.lease_id)
                 || !valid_target(&r.target_host, r.target_port)
                 || (r.load_balance && (targets.len() < 2 || targets.len() > 16))
                 || targets.iter().any(|t| !valid_target(&t.host, t.port))
@@ -151,12 +158,29 @@ impl Engine {
             }
             wanted.entry(r.id.clone()).or_insert_with(|| r.clone());
         }
+        {
+            let mut leases = self.leases.lock().unwrap();
+            let policies: HashMap<_, _> =
+                wanted.values().map(|r| (&r.lease_id, &r.limits)).collect();
+            for (id, policy) in policies {
+                let gate = leases
+                    .entry(id.clone())
+                    .or_insert_with(|| Gate::new(id.clone()));
+                gate.configure(
+                    policy,
+                    c.lease_limits.iter().find(|g| g.lease_id == *id),
+                    c.valid_for_seconds,
+                );
+            }
+            leases.retain(|id, g| !g.idle() || wanted.values().any(|r| r.lease_id == *id));
+        }
         let mut map = self.rules.lock().await;
         let mut remove = Vec::new();
         for (id, f) in map.iter() {
             let old = f.active.load();
             if let Some(r) = wanted.get(id)
                 && !f.task.is_finished()
+                && old.rule.lease_id == r.lease_id
                 && old.rule.listen_ip == r.listen_ip
                 && old.rule.listen_port == r.listen_port
                 && old.rule.targets() == r.targets()
@@ -165,6 +189,7 @@ impl Engine {
                     f.active.store(Arc::new(Active {
                         rule: r.clone(),
                         meter: self.journal.meter(&r.id, &r.cycle_id),
+                        gate: old.gate.clone(),
                     }));
                 }
                 continue;
@@ -200,6 +225,7 @@ impl Engine {
         let udp = Arc::new(UdpSocket::bind(addr).await?);
         let active = Arc::new(ArcSwap::from_pointee(Active {
             meter: self.journal.meter(&r.id, &r.cycle_id),
+            gate: self.leases.lock().unwrap()[&r.lease_id].clone(),
             rule: r,
         }));
         let cancel = CancellationToken::new();
@@ -222,6 +248,14 @@ impl Engine {
             cancel,
             task,
         })
+    }
+    pub fn lease_usage(&self) -> Vec<LeaseUsage> {
+        self.leases
+            .lock()
+            .unwrap()
+            .values()
+            .map(|g| g.usage())
+            .collect()
     }
     pub async fn active_rule_ids(&self) -> Vec<String> {
         let map = self.rules.lock().await;
@@ -353,6 +387,10 @@ async fn stream(
     mut client: TcpStream,
     targets: Vec<Target>,
 ) {
+    let gate = a.load().gate.clone();
+    let Some(_lease_slot) = gate.tcp().await else {
+        return;
+    };
     let dial = async {
         for t in targets {
             if let Ok(ip) = e.resolver.resolve(&t.host).await
@@ -381,6 +419,7 @@ async fn pump<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin>
     up: bool,
 ) -> Result<()> {
     let mut buf = vec![0u8; 32768];
+    let gate = a.load().gate.clone();
     loop {
         let n = tokio::time::timeout(Duration::from_secs(300), src.read(&mut buf)).await??;
         if n == 0 {
@@ -389,7 +428,15 @@ async fn pump<R: tokio::io::AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin>
         }
         let mut at = 0;
         while at < n {
-            let m = tokio::time::timeout(Duration::from_secs(15), dst.write(&buf[at..n])).await??;
+            let allowance = if gate.bandwidth_limited() {
+                gate.take(n - at).await
+            } else {
+                n - at
+            };
+            let m =
+                tokio::time::timeout(Duration::from_secs(15), dst.write(&buf[at..at + allowance]))
+                    .await??;
+            gate.refund(allowance - m);
             if m == 0 {
                 bail!("write zero")
             }
@@ -417,10 +464,11 @@ async fn udp_loop(
           if clients.get(&client).is_some_and(|tx|tx.is_closed()){clients.remove(&client);}
           if let std::collections::hash_map::Entry::Vacant(entry) = clients.entry(client){
            let Ok(slot)=e.udp.clone().try_acquire_owned()else{continue};
+           let Some(lease_slot)=a.load().gate.udp()else{continue};
            // Absorb a full scheduler burst; the shared byte semaphore still caps total queued payload at 8 MiB.
            let(tx,rx)=mpsc::channel(128);entry.insert(tx);
            let(e,a,cursor,socket,c)=(e.clone(),a.clone(),cursor.clone(),socket.clone(),cancel.clone());
-           tasks.spawn(async move{let _slot=slot;tokio::select!{_=c.cancelled()=>(),_=udp_session(e,a,cursor,socket,client,rx)=>()}});
+           tasks.spawn(async move{let _slot=slot;let _lease_slot=lease_slot;tokio::select!{_=c.cancelled()=>(),_=udp_session(e,a,cursor,socket,client,rx)=>()}});
           }
           if let Ok(bytes)=e.queued.clone().try_acquire_many_owned(n.max(1) as u32){let _=clients[&client].try_send((buf[..n].to_vec(),bytes));}
          }
@@ -437,6 +485,7 @@ async fn udp_session(
     client: SocketAddr,
     mut rx: mpsc::Receiver<Packet>,
 ) {
+    let gate = a.load().gate.clone();
     let mut selected = None;
     for t in ordered(&a, &cursor) {
         if let Ok(ip) = e.resolver.resolve(&t.host).await {
@@ -462,13 +511,16 @@ async fn udp_session(
         tokio::select! {
          _=tokio::time::sleep_until((last+Duration::from_secs(30)).into())=>break,
          packet=rx.recv()=>{let Some((data,_bytes))=packet else{break};
+          last=Instant::now();
+          if !gate.packet(data.len()) {continue;}
           if checked.elapsed()>=e.resolver.ttl {
            let Ok(new_ip)=e.resolver.resolve(&target.host).await else{break};
            if new_ip!=ip{let Ok(s)=connect(new_ip,target.port).await else{break};backend=s;ip=new_ip;}checked=Instant::now();
           }
           if let Ok(Ok(n))=tokio::time::timeout(Duration::from_secs(3),backend.send(&data)).await{a.load().meter.add(n,true);last=Instant::now();}else{break}
          },
-         r=backend.recv(&mut buf)=>{let Ok(n)=r else{break};if let Ok(Ok(w))=tokio::time::timeout(Duration::from_secs(3),front.send_to(&buf[..n],client)).await{a.load().meter.add(w,false);last=Instant::now();}else{break}}
+         r=backend.recv(&mut buf)=>{let Ok(n)=r else{break};last=Instant::now();if !gate.packet(n){continue;}
+         if let Ok(Ok(w))=tokio::time::timeout(Duration::from_secs(3),front.send_to(&buf[..n],client)).await{a.load().meter.add(w,false);last=Instant::now();}else{break}}
         }
     }
 }

@@ -50,6 +50,7 @@ async fn real_tcp_udp_half_close_live_cycle_and_shutdown() {
     let port = listener.local_addr().unwrap().port();
     drop(listener);
     let rule = Rule {
+        limits: Default::default(),
         id: "rule".into(),
         user_id: "user".into(),
         lease_id: "lease".into(),
@@ -179,6 +180,7 @@ async fn tcp_udp_bind_is_atomic_and_capacity_is_bounded() {
             target_host: "127.0.0.1".into(),
             target_port: target,
             expires_at: now() + 60,
+            lease_id: "lease".into(),
             ..Default::default()
         }],
         ..Default::default()
@@ -227,6 +229,7 @@ async fn incremental_changes_preserve_unrelated_live_connections() {
         target_host: "127.0.0.1".into(),
         target_port: target,
         expires_at: now() + 300,
+        lease_id: "lease".into(),
         ..Default::default()
     };
     let mut baseline = Config {

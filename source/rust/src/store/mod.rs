@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 mod billing;
 mod lifecycle;
 mod migration;
+mod resources;
 mod traffic;
 #[derive(Debug)]
 pub struct Fault {
@@ -96,6 +97,7 @@ pub async fn rows(db: &mut MySqlConnection, sql: &str, args: &[Value]) -> Result
                 Value::Null
             } else if [
                 "disabled",
+                "supports_limits",
                 "enabled",
                 "manual_paused",
                 "ended",
@@ -169,11 +171,11 @@ async fn audit(db: &mut MySqlConnection, event: &str, subject: &str, detail: &st
     .await?;
     Ok(())
 }
-const PLAN: &str = "SELECT id,name,port_limit,traffic_limit AS traffic_limit_bytes,period_days,price_cents,reset_price_cents,node_ids,enabled,deleted FROM vp_plans";
-const LEASE: &str = "SELECT l.id,l.user_id,l.plan_id,l.plan_name,l.port_limit,l.traffic_limit AS traffic_limit_bytes,l.period_days,l.node_ids,l.expires_at,l.next_reset_at,l.current_cycle AS cycle_id,l.manual_paused,l.ended,l.deleted,c.up AS used_up,c.down AS used_down,(SELECT COUNT(*) FROM vp_allocations a WHERE a.lease_id=l.id AND a.released=0) AS used_ports FROM vp_leases l JOIN vp_cycles c ON c.id=l.current_cycle";
+const PLAN: &str = "SELECT id,name,port_limit,traffic_limit AS traffic_limit_bytes,period_days,price_cents,reset_price_cents,node_ids,enabled,deleted,bandwidth_mbps,tcp_limit,udp_limit FROM vp_plans";
+const LEASE: &str = "SELECT l.id,l.user_id,l.plan_id,l.plan_name,l.port_limit,l.traffic_limit AS traffic_limit_bytes,l.period_days,l.node_ids,l.expires_at,l.next_reset_at,l.current_cycle AS cycle_id,l.manual_paused,l.ended,l.deleted,l.bandwidth_mbps,l.tcp_limit,l.udp_limit,c.up AS used_up,c.down AS used_down,(SELECT COUNT(*) FROM vp_allocations a WHERE a.lease_id=l.id AND a.released=0) AS used_ports FROM vp_leases l JOIN vp_cycles c ON c.id=l.current_cycle";
 const ALLOCATION: &str = "SELECT a.id,a.lease_id,a.node_id,a.public_ip,a.bind_ip,a.port,a.target_host,a.target_port,a.released,COALESCE(t.targets,'[]') AS targets FROM vp_allocations a LEFT JOIN vp_allocation_targets t ON t.rule_id=a.id";
 const ORDER: &str = "SELECT id,user_id,plan_id,lease_id,kind,amount_cents,status,created_at,paid_at,snapshot FROM vp_orders";
-const NODES: &str = "SELECT n.id,n.name,n.enabled,n.last_seen,n.applied_revision,n.probe,n.errors,n.active_rules,n.applied_rules,n.agent_version,n.kernel_version,COALESCE(d.status,'') AS removal_status FROM vp_nodes n LEFT JOIN vp_node_removals d ON d.node_id=n.id WHERE n.deleted=0";
+const NODES: &str = "SELECT n.id,n.name,n.enabled,n.last_seen,n.applied_revision,n.probe,n.errors,n.active_rules,n.applied_rules,n.agent_version,n.kernel_version,n.supports_limits,COALESCE(d.status,'') AS removal_status FROM vp_nodes n LEFT JOIN vp_node_removals d ON d.node_id=n.id WHERE n.deleted=0";
 async fn lease(db: &mut MySqlConnection, id: &str) -> Result<Value> {
     one(db, &format!("{LEASE} WHERE l.id=?"), &[json!(id)]).await
 }
@@ -252,6 +254,17 @@ impl Store {
         if count(&mut db, "SELECT COUNT(*) n FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='vp_nodes' AND column_name='applied_rules'", &[]).await? == 0 {
             exec(&mut db, "ALTER TABLE vp_nodes ADD COLUMN applied_rules MEDIUMTEXT NULL", &[]).await?;
         }
+        for table in ["vp_plans", "vp_leases"] {
+            for field in ["bandwidth_mbps", "tcp_limit", "udp_limit"] {
+                if count(&mut db, "SELECT COUNT(*) n FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name=? AND column_name=?", &[json!(table),json!(field)]).await? == 0 {
+                    exec(&mut db, &format!("ALTER TABLE {table} ADD COLUMN {field} INT NOT NULL DEFAULT 0"), &[]).await?;
+                }
+            }
+        }
+        if count(&mut db, "SELECT COUNT(*) n FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='vp_nodes' AND column_name='supports_limits'", &[]).await? == 0 {
+            exec(&mut db, "ALTER TABLE vp_nodes ADD COLUMN supports_limits BOOLEAN NOT NULL DEFAULT 0", &[]).await?;
+        }
+        exec(&mut db, "CREATE TABLE IF NOT EXISTS vp_resource_limits(lease_id VARCHAR(80) COLLATE utf8mb4_bin PRIMARY KEY,state MEDIUMTEXT NOT NULL,FOREIGN KEY(lease_id) REFERENCES vp_leases(id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4", &[]).await?;
         drop(db);
         Ok(Arc::new(Self {
             pool,
@@ -425,8 +438,43 @@ impl Store {
                 }
                 bump(db).await?;
             }
+            "preview-plan" => {
+                lifecycle::administrator(db, c).await?;
+                return lifecycle::preview_plan(db, &c["plan"]).await;
+            }
             "plan" => {
-                let p = &c["plan"];
+                let mut normalized = c["plan"].clone();
+                if ["bandwidth_mbps", "tcp_limit", "udp_limit"]
+                    .iter()
+                    .any(|k| normalized.get(*k).is_none())
+                {
+                    let previous = rows(
+                        db,
+                        "SELECT bandwidth_mbps,tcp_limit,udp_limit FROM vp_plans WHERE id=?",
+                        &[normalized["id"].clone()],
+                    )
+                    .await?;
+                    if let Some(old) = previous.first() {
+                        for key in ["bandwidth_mbps", "tcp_limit", "udp_limit"] {
+                            if normalized.get(key).is_none() {
+                                normalized[key] = old[key].clone();
+                            }
+                        }
+                    }
+                }
+                let limits: Limits =
+                    serde_json::from_value(normalized.clone()).map_err(|_| invalid())?;
+                if !limits.valid() {
+                    return Err(invalid());
+                }
+                for (key, value) in [
+                    ("bandwidth_mbps", limits.bandwidth_mbps),
+                    ("tcp_limit", limits.tcp_limit),
+                    ("udp_limit", limits.udp_limit),
+                ] {
+                    normalized[key] = json!(value);
+                }
+                let p = &normalized;
                 let ids = p["node_ids"].as_array().ok_or_else(invalid)?;
                 if !valid_id(s(p, "id"))
                     || !name_ok(s(p, "name"))
@@ -464,9 +512,25 @@ impl Store {
                 {
                     return Err(missing());
                 }
-                exec(db,"INSERT INTO vp_plans(id,name,port_limit,traffic_limit,period_days,price_cents,reset_price_cents,node_ids,enabled) VALUES(?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE name=VALUES(name),port_limit=VALUES(port_limit),traffic_limit=VALUES(traffic_limit),period_days=VALUES(period_days),price_cents=VALUES(price_cents),reset_price_cents=VALUES(reset_price_cents),node_ids=VALUES(node_ids),enabled=VALUES(enabled)",&["id","name","port_limit","traffic_limit_bytes","period_days","price_cents","reset_price_cents","node_ids","enabled"].iter().map(|k|p[*k].clone()).collect::<Vec<_>>()).await?;
-                if b(c, "update_existing") {
-                    lifecycle::sync_leases(db, p).await?;
+                let impact = if b(c, "update_existing") {
+                    lifecycle::administrator(db, c).await?;
+                    let preview = lifecycle::preview_plan(db, p).await?;
+                    if s(c, "preview_digest").is_empty()
+                        || s(c, "preview_digest") != s(&preview, "digest")
+                    {
+                        return Err(Fault {
+                            code: 409,
+                            message: "套餐或规则已变化，请重新预览后确认",
+                        }
+                        .into());
+                    }
+                    Some(preview)
+                } else {
+                    None
+                };
+                exec(db,"INSERT INTO vp_plans(id,name,port_limit,traffic_limit,period_days,price_cents,reset_price_cents,node_ids,enabled,bandwidth_mbps,tcp_limit,udp_limit) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE name=VALUES(name),port_limit=VALUES(port_limit),traffic_limit=VALUES(traffic_limit),period_days=VALUES(period_days),price_cents=VALUES(price_cents),reset_price_cents=VALUES(reset_price_cents),node_ids=VALUES(node_ids),enabled=VALUES(enabled),bandwidth_mbps=VALUES(bandwidth_mbps),tcp_limit=VALUES(tcp_limit),udp_limit=VALUES(udp_limit)",&["id","name","port_limit","traffic_limit_bytes","period_days","price_cents","reset_price_cents","node_ids","enabled","bandwidth_mbps","tcp_limit","udp_limit"].iter().map(|k|p[*k].clone()).collect::<Vec<_>>()).await?;
+                if let Some(preview) = impact {
+                    lifecycle::sync_leases(db, p, &preview).await?;
                 }
                 bump(db).await?;
             }
@@ -723,7 +787,7 @@ impl Store {
                 ..Default::default()
             });
         }
-        let sql = "SELECT a.id,l.user_id,l.id AS lease_id,l.current_cycle AS cycle_id,a.bind_ip AS listen_ip,a.port AS listen_port,a.target_host,a.target_port,l.expires_at,COALESCE(at.targets,'[]') AS targets FROM vp_allocations a LEFT JOIN vp_allocation_targets at ON at.rule_id=a.id JOIN vp_nodes n ON n.id=a.node_id JOIN vp_leases l ON l.id=a.lease_id JOIN vp_cycles c ON c.id=l.current_cycle JOIN vp_users u ON u.id=l.user_id WHERE a.node_id=? AND n.enabled=1 AND n.deleted=0 AND a.released=0 AND a.target_host<>'' AND l.deleted=0 AND l.ended=0 AND l.manual_paused=0 AND l.expires_at>? AND u.disabled=0 AND (l.traffic_limit=0 OR c.up+c.down<l.traffic_limit)";
+        let sql = "SELECT a.id,l.user_id,l.id AS lease_id,l.current_cycle AS cycle_id,a.bind_ip AS listen_ip,a.port AS listen_port,a.target_host,a.target_port,l.expires_at,l.bandwidth_mbps,l.tcp_limit,l.udp_limit,COALESCE(at.targets,'[]') AS targets FROM vp_allocations a LEFT JOIN vp_allocation_targets at ON at.rule_id=a.id JOIN vp_nodes n ON n.id=a.node_id JOIN vp_leases l ON l.id=a.lease_id JOIN vp_cycles c ON c.id=l.current_cycle JOIN vp_users u ON u.id=l.user_id WHERE a.node_id=? AND n.enabled=1 AND n.deleted=0 AND a.released=0 AND a.target_host<>'' AND l.deleted=0 AND l.ended=0 AND l.manual_paused=0 AND l.expires_at>? AND u.disabled=0 AND (l.traffic_limit=0 OR c.up+c.down<l.traffic_limit)";
         let rules = rows(&mut db, sql, &[json!(node), json!(now())])
             .await?
             .into_iter()

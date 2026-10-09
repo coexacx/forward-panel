@@ -24,7 +24,7 @@ pub(super) async fn grant(db: &mut MySqlConnection, user: &str, p: &Value) -> Re
     let at = now() + n(&p, "period_days") * 86400;
     exec(
         db,
-        "INSERT INTO vp_leases(id,user_id,plan_id,plan_name,port_limit,traffic_limit,period_days,node_ids,expires_at,next_reset_at,current_cycle,manual_paused,ended) VALUES(?,?,?,?,?,?,?,?,?,?,?,0,0)",
+        "INSERT INTO vp_leases(id,user_id,plan_id,plan_name,port_limit,traffic_limit,period_days,node_ids,expires_at,next_reset_at,current_cycle,manual_paused,ended,bandwidth_mbps,tcp_limit,udp_limit) VALUES(?,?,?,?,?,?,?,?,?,?,?,0,0,?,?,?)",
         &[
             json!(lid),
             json!(user),
@@ -37,6 +37,9 @@ pub(super) async fn grant(db: &mut MySqlConnection, user: &str, p: &Value) -> Re
             json!(at),
             json!(at),
             json!(cycle),
+            json!(n(&p,"bandwidth_mbps")),
+            json!(n(&p,"tcp_limit")),
+            json!(n(&p,"udp_limit")),
         ],
     )
     .await?;

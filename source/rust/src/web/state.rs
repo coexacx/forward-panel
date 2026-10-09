@@ -92,6 +92,7 @@ pub async fn snapshot(ctx: &Context<'_>, admin: bool) -> Result<Value> {
             load_balance: b(a, "load_balance"),
             targets: serde_json::from_value(a["targets"].clone()).unwrap_or_default(),
             expires_at: n(lease, "expires_at"),
+            limits: serde_json::from_value(lease.clone()).unwrap_or_default(),
         };
         let pending = if let Some(applied) = node["applied_rules"].as_object() {
             applied.get(s(a, "id")).and_then(Value::as_str) != Some(expected.fingerprint().as_str())
@@ -112,6 +113,8 @@ pub async fn snapshot(ctx: &Context<'_>, admin: bool) -> Result<Value> {
             "unconfigured"
         } else if !b(node, "online") {
             "offline"
+        } else if expected.limits.enabled() && !b(node, "supports_limits") {
+            "agent_upgrade_required"
         } else if pending {
             "pending"
         } else if node["errors"].as_array().is_some_and(|errors| {

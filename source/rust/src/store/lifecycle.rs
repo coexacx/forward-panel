@@ -102,46 +102,174 @@ pub(super) async fn delete_lease(db: &mut MySqlConnection, c: &Value) -> Result<
     Ok(json!({"ok":true}))
 }
 
-pub(super) async fn sync_leases(db: &mut MySqlConnection, p: &Value) -> Result<()> {
+pub(super) async fn preview_plan(db: &mut MySqlConnection, p: &Value) -> Result<Value> {
+    let original = plan(db, s(p, "id")).await?;
+    if b(&original, "deleted") || !(1..=500).contains(&n(p, "port_limit")) {
+        return Err(invalid());
+    }
+    let policy: Limits = serde_json::from_value(p.clone()).map_err(|_| invalid())?;
+    if !policy.valid() {
+        return Err(invalid());
+    }
     let ls = rows(
         db,
-        &format!("{LEASE} WHERE l.plan_id=? AND l.ended=0 AND l.deleted=0"),
+        &format!(
+            "{LEASE} WHERE l.plan_id=? AND l.ended=0 AND l.deleted=0 ORDER BY l.id LIMIT 2001"
+        ),
         &[p["id"].clone()],
     )
     .await?;
-    for l in ls {
-        let allocations=rows(db,"SELECT id,node_id,port FROM vp_allocations WHERE lease_id=? AND released=0 ORDER BY port,id",&[l["id"].clone()]).await?;
-        let mut kept = 0;
-        for a in allocations {
-            if in_ids(&p["node_ids"], s(&a, "node_id")) && kept < n(p, "port_limit") {
-                kept += 1;
-            } else {
-                exec(
-                    db,
-                    "UPDATE vp_allocations SET released=1,target_host='',target_port=0 WHERE id=?",
-                    &[a["id"].clone()],
-                )
-                .await?;
-                exec(
-                    db,
-                    "DELETE FROM vp_allocation_targets WHERE rule_id=?",
-                    &[a["id"].clone()],
-                )
-                .await?;
-                exec(
-                    db,
-                    "DELETE FROM vp_metadata WHERE id=?",
-                    &[json!(format!("allocation_{}", s(&a, "id")))],
-                )
-                .await?;
+    if ls.len() > 2000 {
+        return Err(Fault {
+            code: 409,
+            message: "受影响套餐超过 2000 份，请先整理后再强制更新",
+        }
+        .into());
+    }
+    let fields = [
+        "plan_name",
+        "port_limit",
+        "traffic_limit_bytes",
+        "period_days",
+        "node_ids",
+        "bandwidth_mbps",
+        "tcp_limit",
+        "udp_limit",
+    ];
+    let mut details = Vec::new();
+    let mut basis = Vec::new();
+    let mut users = HashSet::new();
+    let mut released = 0usize;
+    let mut total_rules = 0usize;
+    let mut pausing = 0usize;
+    let mut resuming = 0usize;
+    let mut upgrades = Vec::new();
+    if policy.enabled() {
+        for nid in p["node_ids"].as_array().ok_or_else(invalid)? {
+            let node = one(
+                db,
+                "SELECT id,name,supports_limits FROM vp_nodes WHERE id=? AND deleted=0",
+                std::slice::from_ref(nid),
+            )
+            .await?;
+            if !b(&node, "supports_limits") {
+                upgrades.push(node);
             }
         }
-        exec(db,"UPDATE vp_leases SET plan_name=?,port_limit=?,traffic_limit=?,period_days=?,node_ids=? WHERE id=?",&[p["name"].clone(),p["port_limit"].clone(),p["traffic_limit_bytes"].clone(),p["period_days"].clone(),p["node_ids"].clone(),l["id"].clone()]).await?;
+    }
+    for l in ls {
+        let owner=one(db,"SELECT u.id,u.name,u.disabled,COALESCE(a.username,'') AS username FROM vp_users u LEFT JOIN vp_accounts a ON a.id=u.id WHERE u.id=?",&[l["user_id"].clone()]).await?;
+        let allocations = rows(
+            db,
+            &format!("{ALLOCATION} WHERE a.lease_id=? AND a.released=0 ORDER BY a.port,a.id"),
+            &[l["id"].clone()],
+        )
+        .await?;
+        total_rules += allocations.len();
+        if total_rules > 10_000 {
+            return Err(Fault {
+                code: 409,
+                message: "受影响规则超过 10000 条，请先整理后再强制更新",
+            }
+            .into());
+        }
+        let mut kept = 0;
+        let mut removing = Vec::new();
+        for a in &allocations {
+            let reason = if !in_ids(&p["node_ids"], s(a, "node_id")) {
+                "node_removed"
+            } else if kept >= n(p, "port_limit") {
+                "port_quota"
+            } else {
+                kept += 1;
+                continue;
+            };
+            let mut entry = a.clone();
+            entry["reason"] = json!(reason);
+            removing.push(entry);
+        }
+        let mut before = json!({});
+        let mut after = json!({});
+        for field in fields {
+            before[field] = l[field].clone();
+            after[field] = if field == "plan_name" {
+                p["name"].clone()
+            } else if ["bandwidth_mbps", "tcp_limit", "udp_limit"].contains(&field) {
+                json!(n(p, field))
+            } else {
+                p[field].clone()
+            };
+        }
+        let eligible =
+            !b(&owner, "disabled") && !b(&l, "manual_paused") && n(&l, "expires_at") > now();
+        let used = n(&l, "used_up") + n(&l, "used_down");
+        let was_limited = n(&l, "traffic_limit_bytes") > 0 && used >= n(&l, "traffic_limit_bytes");
+        let becomes_limited =
+            n(p, "traffic_limit_bytes") > 0 && used >= n(p, "traffic_limit_bytes");
+        let will_pause = eligible && !was_limited && becomes_limited;
+        let will_resume = eligible && was_limited && !becomes_limited;
+        released += removing.len();
+        pausing += usize::from(will_pause);
+        resuming += usize::from(will_resume);
+        users.insert(s(&l, "user_id").to_owned());
+        // Do not bind to constantly changing byte counters. Bind to their actual
+        // pause/resume consequences, and to every structural billing/rule field.
+        basis.push(json!({"id":l["id"],"owner":owner,"before":before,"allocations":allocations,
+            "cycle_id":l["cycle_id"],"expires_at":l["expires_at"],"next_reset_at":l["next_reset_at"],
+            "manual_paused":l["manual_paused"],"will_pause":will_pause,"will_resume":will_resume}));
+        details.push(json!({"id":l["id"],"user_id":l["user_id"],"user_name":owner["name"],"username":owner["username"],
+            "before":before,"after":after,"release_rules":removing,"kept_rules":kept,
+            "will_pause":will_pause,"will_resume":will_resume,"used_bytes":used,
+            "expires_at":l["expires_at"],"next_reset_at":l["next_reset_at"]}));
+    }
+    let mut requested = p.clone();
+    for key in ["bandwidth_mbps", "tcp_limit", "udp_limit"] {
+        requested[key] = json!(n(p, key));
+    }
+    let digest = hex::encode(Sha256::digest(serde_json::to_vec(
+        &json!({"plan":original,"requested":requested,"leases":basis,"upgrades":upgrades}),
+    )?));
+    Ok(
+        json!({"digest":digest,"plan":original,"requested":requested,"leases":details,"upgrade_nodes":upgrades,
+        "users_count":users.len(),"leases_count":details.len(),"release_count":released,
+        "pause_count":pausing,"resume_count":resuming}),
+    )
+}
+
+pub(super) async fn sync_leases(
+    db: &mut MySqlConnection,
+    p: &Value,
+    preview: &Value,
+) -> Result<()> {
+    for entry in preview["leases"].as_array().ok_or_else(invalid)? {
+        for a in entry["release_rules"].as_array().ok_or_else(invalid)? {
+            exec(
+                db,
+                "UPDATE vp_allocations SET released=1,target_host='',target_port=0 WHERE id=?",
+                &[a["id"].clone()],
+            )
+            .await?;
+            exec(
+                db,
+                "DELETE FROM vp_allocation_targets WHERE rule_id=?",
+                &[a["id"].clone()],
+            )
+            .await?;
+            exec(
+                db,
+                "DELETE FROM vp_metadata WHERE id=?",
+                &[json!(format!("allocation_{}", s(a, "id")))],
+            )
+            .await?;
+        }
+        exec(db,"UPDATE vp_leases SET plan_name=?,port_limit=?,traffic_limit=?,period_days=?,node_ids=?,bandwidth_mbps=?,tcp_limit=?,udp_limit=? WHERE id=?",
+            &[p["name"].clone(),p["port_limit"].clone(),p["traffic_limit_bytes"].clone(),p["period_days"].clone(),p["node_ids"].clone(),
+            json!(n(p,"bandwidth_mbps")),json!(n(p,"tcp_limit")),json!(n(p,"udp_limit")),entry["id"].clone()]).await?;
         audit(
             db,
             "lease_plan_synced",
-            s(&l, "id"),
-            "configuration updated; expiry, next reset and consumed traffic retained",
+            s(entry, "id"),
+            "reviewed update; expiry, natural reset and consumed traffic retained",
         )
         .await?;
     }

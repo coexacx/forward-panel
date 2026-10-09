@@ -99,6 +99,9 @@ async fn lifecycle_edits_deletion_late_counters_and_payment() {
             .all(|x| x["public_ip"] == "172.20.0.5" && x["bind_ip"] == "1.1.1.1")
     );
 
+    p["bandwidth_mbps"] = json!(8);
+    p["tcp_limit"] = json!(2);
+    p["udp_limit"] = json!(1);
     p["name"] = json!("Package B");
     p["port_limit"] = json!(1);
     p["traffic_limit_bytes"] = json!(100);
@@ -111,7 +114,17 @@ async fn lifecycle_edits_deletion_late_counters_and_payment() {
         .unwrap();
     assert_eq!(unchanged["port_limit"], 3);
     assert_eq!(unchanged["used_ports"], 3);
-    db.command(json!({"action":"plan","plan":p,"update_existing":true}))
+    assert_eq!(unchanged["bandwidth_mbps"], 0);
+    assert!(
+        db.command(json!({"action":"plan","plan":p,"actor_id":owner,"update_existing":true}))
+            .await
+            .is_err()
+    );
+    let preview = db
+        .command(json!({"action":"preview-plan","actor_id":owner,"plan":p}))
+        .await
+        .unwrap();
+    db.command(json!({"action":"plan","plan":p,"actor_id":owner,"update_existing":true,"preview_digest":preview["digest"]}))
         .await
         .unwrap();
     let synced = db
@@ -119,6 +132,9 @@ async fn lifecycle_edits_deletion_late_counters_and_payment() {
         .await
         .unwrap();
     assert_eq!(synced["port_limit"], 1);
+    assert_eq!(synced["bandwidth_mbps"], 8);
+    assert_eq!(synced["tcp_limit"], 2);
+    assert_eq!(synced["udp_limit"], 1);
     assert_eq!(synced["used_ports"], 1);
     assert_eq!(synced["plan_name"], "Package B");
     assert_eq!(synced["period_days"], 45);
@@ -129,7 +145,16 @@ async fn lifecycle_edits_deletion_late_counters_and_payment() {
     assert!(db.rules(&node).await.unwrap().rules.is_empty());
     assert!(db.rules(&second_node).await.unwrap().rules.is_empty());
     p["traffic_limit_bytes"] = json!(1000);
-    db.command(json!({"action":"plan","plan":p,"update_existing":true}))
+    assert!(
+        db.command(json!({"action":"plan","plan":p,"actor_id":owner,"update_existing":true}))
+            .await
+            .is_err()
+    );
+    let preview = db
+        .command(json!({"action":"preview-plan","actor_id":owner,"plan":p}))
+        .await
+        .unwrap();
+    db.command(json!({"action":"plan","plan":p,"actor_id":owner,"update_existing":true,"preview_digest":preview["digest"]}))
         .await
         .unwrap();
     assert_eq!(db.rules(&node).await.unwrap().rules.len(), 1);

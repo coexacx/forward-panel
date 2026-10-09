@@ -217,6 +217,8 @@ async fn session(
         r.active_rules = Some(e.active_rule_ids().await);
         r.applied_rules = Some(applied_rules.clone());
         r.supports_delta = true;
+        r.supports_limits = true;
+        r.lease_usage = e.lease_usage();
         r.probe = sampler.sample();
         r.probe.target_checks = Some(e.target_checks().await);
         r.decommission_ack = decommission.clone();

@@ -285,7 +285,7 @@ pub async fn dispatch(ctx: &mut Context<'_>, route: &str, v: &Value) -> Result<V
             .await?;
             Ok(json!({"ok":true}))
         }
-        "admin/plan" => {
+        "admin/plan" | "admin/preview-plan" => {
             let ids = v["node_ids"]
                 .as_array()
                 .filter(|a| !a.is_empty() && a.len() <= 50)
@@ -296,9 +296,75 @@ pub async fn dispatch(ctx: &mut Context<'_>, route: &str, v: &Value) -> Result<V
                 }
             }
             let p = json!({"id":if s(v,"id").is_empty(){id()}else{ident(v,"id")?},"name":text(v,"name",40,true)?,"port_limit":integer(v,"port_limit",1,500)?,"traffic_limit_bytes":integer(v,"traffic_limit_bytes",0,1_000_000_000_000_000)?,"period_days":integer(v,"period_days",1,366)?,"price_cents":integer(v,"price_cents",0,9_999_999)?,"reset_price_cents":integer(v,"reset_price_cents",0,9_999_999)?,"node_ids":ids,"enabled":b(v,"enabled")});
+            let mut p = p;
+            let mut limit_input = v.clone();
+            if !s(v, "id").is_empty()
+                && ["bandwidth_mbps", "tcp_limit", "udp_limit"]
+                    .iter()
+                    .any(|k| v.get(*k).is_none())
+            {
+                let mut db = ctx.app.store.pool.acquire().await?;
+                let previous = rows(
+                    &mut db,
+                    "SELECT bandwidth_mbps,tcp_limit,udp_limit FROM vp_plans WHERE id=?",
+                    &[v["id"].clone()],
+                )
+                .await?;
+                if let Some(old) = previous.first() {
+                    for key in ["bandwidth_mbps", "tcp_limit", "udp_limit"] {
+                        if v.get(key).is_none() {
+                            limit_input[key] = old[key].clone();
+                        }
+                    }
+                }
+            }
+            let limits: crate::protocol::Limits = serde_json::from_value(limit_input)
+                .map_err(|_| fail(400, "带宽与连接数必须是有效整数"))?;
+            if !limits.valid() {
+                return Err(fail(400, "带宽或连接数超出允许范围"));
+            }
+            p["bandwidth_mbps"] = json!(limits.bandwidth_mbps);
+            p["tcp_limit"] = json!(limits.tcp_limit);
+            p["udp_limit"] = json!(limits.udp_limit);
+            if route == "admin/preview-plan" {
+                rate(ctx.app, &format!("plan-preview:{}", s(&user, "id")), 20, 60).await?;
+                if s(v, "id").is_empty() {
+                    return Err(fail(400, "新套餐无需强制更新预览"));
+                }
+                let preview = ctx
+                    .app
+                    .store
+                    .command(json!({"action":"preview-plan","actor_id":user["id"],"plan":p}))
+                    .await?;
+                let token = auth::seal(
+                    ctx.app,
+                    &json!({"purpose":"plan-change","actor_id":user["id"],"plan":p,
+                    "digest":preview["digest"],"expires":now()+300})
+                    .to_string(),
+                )?;
+                return Ok(json!({"preview":preview,"preview_token":token}));
+            }
+            let mut digest = String::new();
+            if b(v, "update_existing") {
+                let raw = text(v, "preview_token", 16_384, true)
+                    .map_err(|_| fail(409, "请先预览强制更新的影响"))?;
+                let decoded = auth::unseal(ctx.app, &raw)
+                    .map_err(|_| fail(409, "预览凭证无效，请重新预览"))?;
+                let approved: Value = serde_json::from_str(&decoded)
+                    .map_err(|_| fail(409, "预览凭证无效，请重新预览"))?;
+                if s(&approved, "purpose") != "plan-change"
+                    || approved["actor_id"] != user["id"]
+                    || approved["plan"] != p
+                    || n(&approved, "expires") < now()
+                {
+                    return Err(fail(409, "预览已失效或参数已变化，请重新预览"));
+                }
+                digest = s(&approved, "digest").into();
+            }
             ctx.app
                 .store
-                .command(json!({"action":"plan","plan":p,"update_existing":b(v,"update_existing")}))
+                .command(json!({"action":"plan","actor_id":user["id"],"plan":p,
+                "update_existing":b(v,"update_existing"),"preview_digest":digest}))
                 .await?;
             ctx.audit("保存套餐", "", s(&p, "name")).await?;
             Ok(p)

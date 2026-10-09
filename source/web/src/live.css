@@ -1748,3 +1748,13 @@ input::placeholder {
     scroll-behavior: auto !important;
   }
 }
+
+.limit-fields {display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;}
+.impact-totals {display:flex;flex-wrap:wrap;gap:18px;padding:14px 0;border-bottom:1px solid var(--line);}
+.impact-totals strong {margin-left:8px;font-size:18px;}
+.impact-leases details {border:1px solid var(--line);border-radius:8px;margin:12px 0;padding:12px;}
+.impact-leases summary {cursor:pointer;display:flex;gap:8px;flex-wrap:wrap;justify-content:space-between;}
+.impact-leases summary span {font-size:12px;color:var(--muted);}
+.impact-leases .details dd {overflow-wrap:anywhere;}
+.impact-preview .form-footer {flex-wrap:wrap;}
+@media(max-width:600px){.limit-fields{grid-template-columns:1fr}.impact-leases details{padding:10px}.impact-preview .form-footer .button{flex:1}}

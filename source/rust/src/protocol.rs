@@ -5,6 +5,56 @@ pub struct Target {
     pub host: String,
     pub port: u16,
 }
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Limits {
+    #[serde(skip_serializing_if = "zero")]
+    pub bandwidth_mbps: u32,
+    #[serde(skip_serializing_if = "zero")]
+    pub tcp_limit: u32,
+    #[serde(skip_serializing_if = "zero")]
+    pub udp_limit: u32,
+}
+fn zero(v: &u32) -> bool {
+    *v == 0
+}
+impl Limits {
+    pub fn enabled(&self) -> bool {
+        self.bandwidth_mbps > 0 || self.tcp_limit > 0 || self.udp_limit > 0
+    }
+    pub fn valid(&self) -> bool {
+        self.bandwidth_mbps <= 1_000_000 && self.tcp_limit <= 65_536 && self.udp_limit <= 16_384
+    }
+    pub fn bytes_per_second(&self) -> u64 {
+        u64::from(self.bandwidth_mbps) * 125_000
+    }
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Budget {
+    pub bandwidth: u64,
+    pub tcp: u32,
+    pub udp: u32,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LeaseGrant {
+    pub lease_id: String,
+    pub id: String,
+    pub policy: Limits,
+    pub budget: Budget,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LeaseUsage {
+    pub lease_id: String,
+    pub grant_id: String,
+    pub tcp_active: u32,
+    pub udp_active: u32,
+    pub tcp_waiting: u32,
+    pub udp_waiting: u32,
+    pub bandwidth_needed: bool,
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Rule {
@@ -19,6 +69,8 @@ pub struct Rule {
     pub target_host: String,
     pub target_port: u16,
     pub expires_at: i64,
+    #[serde(flatten)]
+    pub limits: Limits,
 }
 impl Rule {
     pub fn fingerprint(&self) -> String {
@@ -88,12 +140,15 @@ pub struct Report {
     pub active_rules: Option<Vec<String>>,
     pub applied_rules: Option<std::collections::BTreeMap<String, String>>,
     pub supports_delta: bool,
+    pub supports_limits: bool,
+    pub lease_usage: Vec<LeaseUsage>,
     pub errors: Vec<RuleError>,
     pub decommission_ack: String,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    pub lease_limits: Vec<LeaseGrant>,
     pub delta: bool,
     pub base_revision: i64,
     pub removed_rules: Vec<String>,
@@ -140,6 +195,20 @@ impl Config {
             self.rules.len() <= 512 && self.removed_rules.len() <= 512,
             "too many rules"
         );
+        ensure!(self.lease_limits.len() <= 512, "too many lease limits");
+        let mut grants = HashSet::new();
+        for g in &self.lease_limits {
+            ensure!(
+                crate::valid_id(&g.lease_id)
+                    && crate::valid_id(&g.id)
+                    && grants.insert(&g.lease_id)
+                    && g.policy.valid()
+                    && g.budget.bandwidth <= g.policy.bytes_per_second()
+                    && g.budget.tcp <= g.policy.tcp_limit
+                    && g.budget.udp <= g.policy.udp_limit,
+                "invalid lease grant"
+            );
+        }
         let mut seen = HashSet::new();
         for r in &self.rules {
             ensure!(
